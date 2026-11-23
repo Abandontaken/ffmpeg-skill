@@ -6,6 +6,12 @@
 
 (nothing yet)
 
+## 4.7.2
+
+_Automated release: version and notes generated from pull requests merged since 4.7.1._
+
+- Add daily upstream sync workflow (no force-push; conflicts open an issue)
+
 ## 4.7.1
 
 _Automated release: version and notes generated from pull requests merged since 4.7.0._

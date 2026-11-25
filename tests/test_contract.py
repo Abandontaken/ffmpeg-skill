@@ -2387,7 +2387,7 @@ sys.exit(fit.main())
         # in the listing; the full profile had 50 bytes of room, the default 250)
         profiles = (
             ({}, 12, 73_500),
-            ({"FFMPEG_SKILL_MCP_FULL": "1"}, 42, 195_500),
+            ({"FFMPEG_SKILL_MCP_FULL": "1"}, 42, 196_000),  # +500 more for color.py --source-alpha-mode (#453)
             ({"FFMPEG_SKILL_MCP_TOOLS": "probe,cut,fit,export,check"}, 5, 25_000),
         )
         for env, count, limit in profiles:
@@ -3262,7 +3262,7 @@ sys.exit(fit.main())
     DEFECT_CLASSES = ("paths", "not_measured", "claim", "stream", "planned_not_done", "numeric", "ignored_flag",
                       "dry_run", "unbounded", "time", "surface", "test", "several_inputs", "capability",
                       "siblings_refused", "leftovers", "state", "escaping", "generator", "automation",
-                      "ffmpeg_version", "color", "new")
+                      "ffmpeg_version", "color", "text_presentation", "new")
 
     def test_a_fonts_folder_that_cannot_be_listed_is_unknown_coverage_review_of_636(self):
         """A fonts folder that exists but cannot be listed is coverage unknown (None), as an

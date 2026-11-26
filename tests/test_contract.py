@@ -349,13 +349,33 @@ class ContractTests(unittest.TestCase):
             self.assertTrue((ROOT / rel).is_file(), rel)
         pkg = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-        for manifest in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json", "gemini-extension.json"):
+        for manifest in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json",
+                         ".codex-plugin/plugin.json", "gemini-extension.json"):
             doc = json.loads((ROOT / manifest).read_text(encoding="utf-8"))
             self.assertEqual((doc["name"], doc["version"]), ("ffmpeg-skill", pkg["version"]), manifest)
             self.assertTrue(doc.get("description"), manifest)
             self.assertGreaterEqual(release.count(manifest), 2, f"{manifest}: bumped and staged by release.yml")
         cursor = json.loads((ROOT / ".cursor-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertTrue((ROOT / cursor["logo"]).is_file(), "the logo is a committed, relative path")
+        codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        logo = codex["interface"]["logo"]
+        self.assertTrue((ROOT / (logo[2:] if logo.startswith("./") else logo)).is_file(),
+                        "the Codex logo is a committed, relative path inside the plugin")
+        agents_market = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
+        claude_market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+        plugin_source = {
+            "source": "git-subdir",
+            "url": "https://github.com/kajisho5/ffmpeg-skill.git",
+            "path": "ffmpeg-skill",
+            "ref": "plugin",
+        }
+        self.assertEqual(agents_market["name"], "ffmpeg-skill")
+        self.assertEqual([p["name"] for p in agents_market["plugins"]], ["ffmpeg-skill"])
+        self.assertEqual(agents_market["plugins"][0]["source"], plugin_source)
+        self.assertEqual(agents_market["plugins"][0]["source"], claude_market["plugins"][0]["source"],
+                         ".agents marketplace must point at the same plugin-branch tree as .claude-plugin")
+        self.assertEqual(codex["skills"], "./skills/")
+        self.assertNotIn("mcpServers", codex)
         # the npm installer copies one skill directory: the plugin copy must not ride along, or an
         # agent's skills folder would hold the same skill twice
         self.assertNotIn("skills/", pkg["files"])
@@ -504,9 +524,25 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             names = {p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file()}
             for needed in (".claude-plugin/plugin.json", ".claude-plugin/icon.png",
+                           ".codex-plugin/plugin.json", ".codex-plugin/icon.png",
                            "skills/ffmpeg-skill/SKILL.md", "SKILL.md",
                            "scripts/_contract.py", "mcp/server.py", "docs/contract.md"):
                 self.assertIn(needed, names)
+            # Codex skills/ and logo paths resolve inside the shipped plugin-branch layout
+            codex_shipped = json.loads((tree / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+            skills_rel = codex_shipped["skills"]
+            if skills_rel.startswith("./"):
+                skills_rel = skills_rel[2:]
+            self.assertTrue((tree / skills_rel).is_dir(),
+                            f"Codex skills path {codex_shipped['skills']!r} missing in plugin tree")
+            logo_rel = codex_shipped["interface"]["logo"]
+            if logo_rel.startswith("./"):
+                logo_rel = logo_rel[2:]
+            self.assertTrue((tree / logo_rel).is_file(),
+                            f"Codex logo path {codex_shipped['interface']['logo']!r} missing in plugin tree")
+            self.assertTrue((tree / skills_rel / "ffmpeg-skill" / "SKILL.md").is_file())
+            self.assertTrue((tree / "scripts").is_dir())
+            self.assertTrue((tree / "docs" / "contract.md").is_file())
             # bin/ is the npx installer: a plugin host installs, and the plugin directory flags it
             self.assertFalse([n for n in names if n.split("/")[0] in
                               ("tests", "evals", "site", "brand", "demos", "assets", ".github", "bin")])
@@ -590,6 +626,8 @@ class ContractTests(unittest.TestCase):
             # under one directory, which is what a git-subdir marketplace source names
             self.assertTrue(all(n.startswith("ffmpeg-skill/") for n in listed if n), listed[:3])
             self.assertIn("ffmpeg-skill/.claude-plugin/plugin.json", listed)
+            self.assertIn("ffmpeg-skill/.codex-plugin/plugin.json", listed)
+            self.assertIn("ffmpeg-skill/.codex-plugin/icon.png", listed)
             self.assertIn("ffmpeg-skill/skills/ffmpeg-skill/SKILL.md", listed)
             again = publish(bare)                       # the branch holds this tree: nothing is pushed
             self.assertEqual(again.returncode, 0, again.stderr)
@@ -985,11 +1023,18 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(market["plugins"][0]["source"], {
             "source": "git-subdir", "url": "https://github.com/kajisho5/ffmpeg-skill.git", "path": "ffmpeg-skill", "ref": "plugin"})
         self.assertIn("marketplace add kajisho5/ffmpeg-skill --sparse .claude-plugin", readme_text := (ROOT / "README.md").read_text(encoding="utf-8"))
-        # every `marketplace add` line in the README carries the flag, however many there are
-        self.assertEqual(readme_text.count("marketplace add kajisho5/ffmpeg-skill --sparse .claude-plugin"),
-                         readme_text.count("marketplace add kajisho5/ffmpeg-skill"))
-        for host in ("claude plugin marketplace add", "codex plugin marketplace add"):
-            self.assertIn(f"{host} kajisho5/ffmpeg-skill --sparse .claude-plugin", readme_text)
+        # Claude still sparse-checks out .claude-plugin; every Claude `marketplace add` keeps the flag.
+        # The documented Codex route keeps --sparse .claude-plugin (checked against Codex 0.167);
+        # the agent-agnostic .agents/plugins/marketplace.json route does not need it.
+        self.assertEqual(readme_text.count("claude plugin marketplace add kajisho5/ffmpeg-skill --sparse .claude-plugin"),
+                         readme_text.count("claude plugin marketplace add kajisho5/ffmpeg-skill"))
+        self.assertIn("claude plugin marketplace add kajisho5/ffmpeg-skill --sparse .claude-plugin", readme_text)
+        self.assertIn("codex plugin marketplace add kajisho5/ffmpeg-skill --sparse .claude-plugin", readme_text)
+        self.assertIn("checked against Codex CLI 0.167", readme_text)
+        self.assertIn("2.2 MB instead of 66 MB in Codex 0.167", readme_text)
+        self.assertIn("codex plugin marketplace add kajisho5/ffmpeg-skill\n", readme_text)
+        self.assertIn("codex plugin add ffmpeg-skill@ffmpeg-skill", readme_text)
+        self.assertIn(".agents/plugins/marketplace.json", readme_text)
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"/plugin install {manifest['name']} --marketplace kajisho5/ffmpeg-skill", readme)
         self.assertIn(f"claude plugin install {manifest['name']}@{market['name']}", readme)
@@ -2902,6 +2947,20 @@ sys.exit(fit.main())
         self.assertEqual(doc["structuredContent"]["audio"]["codec"], "pcm_s16le")
         proc = sh(sys.executable, ROOT / "mcp" / "server.py", "--call", "not_a_tool")
         self.assertTrue(json.loads(proc.stdout)["isError"])
+
+    def test_pacing_profile_surface_and_mcp_repeated_references(self):
+        tool = self.tools["silence"]
+        schema = tool["output_schema"]["properties"]["profile"]
+        self.assertEqual(schema["properties"]["contract"]["const"], "pacing-profile@1")
+        self.assertIn("noise_floor_db", schema["properties"]["silence_detection"]["required"])
+        self.assertIn("source", self.tools["verify"]["input_schema"]["properties"])
+        args = {"input": str(self.wav), "extract_profile": True,
+                "references": [str(self.wav), str(self.wav)], "dry_run": True}
+        response = self._rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "silence", "arguments": args}}])[0]["result"]
+        self.assertFalse(response.get("isError"), response)
+        profile = response["structuredContent"]["profile"]
+        self.assertEqual(profile["probe_meta"]["analysis_count"], 3)
 
     def test_mcp_round_trips_built_from_the_derived_schema(self):
         listed = {t["name"]: t["inputSchema"] for t in self._rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])[0]["result"]["tools"]}
@@ -9331,6 +9390,52 @@ class EvalRunnerTests(unittest.TestCase):
         # of the slot must match a transcript that names the script with ".py".
         task = {"id": 4, "request": "r", "expect": ["render"], "grader_expect": None, "grader_not": None}
         self.assertTrue(run.score("called render.py --template reel", task)[0])
+
+    def test_score_slot_matches_a_whole_name_not_a_word_that_contains_it(self):
+        run = self.evals_run
+        # agent_prompts_24.json's slots are bare stems, and a substring test let any word holding
+        # one fill the slot: "execute" ran cut, "benefit" fit, "looks" look, so a transcript that
+        # never called the script passed its routing check
+        for slot, text in (("cut", "I will execute the plan"), ("fit", "a clear benefit"),
+                           ("look", "The output looks fine"), ("cut", "ran shortcut.py a.mp4"),
+                           ("cut.py", "ran shortcut.py a.mp4"), ("render", "the renderer is ready"),
+                           ("cut.py", "I will cut the clip")):  # a slot written with .py needs the script
+            task = {"id": 7, "request": "r", "expect": [slot], "grader_expect": None, "grader_not": None}
+            self.assertFalse(run.score(text, task)[0], f"{slot!r} in {text!r}")
+        # the script on a command line or by path, and the tool name an MCP harness logs, still fill it
+        for slot, text in (("cut", "python3 scripts/cut.py a.mp4"), ("cut.py", "$ cut.py a.mp4"),
+                           ("look", "python3 ~/.claude/skills/ffmpeg-skill/scripts/look.py out.mp4"),
+                           ("cut", "python C:\\skills\\ffmpeg-skill\\scripts\\cut.py a.mp4"),
+                           ("cut", "Ran `cut.py`."), ("cut", "scripts/cut.pyで切り出しました"),
+                           ("look", "mcp__ffmpeg-skill__look"), ("look", 'mcp__ffmpeg-skill__look({"input": "out.mp4"})'),
+                           ("fit|render", "ran render.py project.json"),
+                           ("--dry-run", "cut.py a.mp4 --dry-run"), ("--on-missing skip", "join.py --on-missing skip"),
+                           ("--list", "join.py --list a.mp4")):
+            task = {"id": 8, "request": "r", "expect": [slot], "grader_expect": None, "grader_not": None}
+            self.assertTrue(run.score(text, task)[0], f"{slot!r} in {text!r}")
+
+    def test_score_bare_slot_needs_the_tool_called_not_the_word_written(self):
+        run = self.evals_run
+        # the request is part of the transcript, and a bare slot that took the plain word let a
+        # run that only restated the request pass ("I will cut the clip" filled cut); it takes the
+        # script's file name or the MCP tool name, not prose, another script or another file
+        for slot, text in (("cut", "I will cut the clip"), ("look", "let me look at the output"),
+                           ("check", "check the file first"), ("audio", "the audio is fine"),
+                           ("fit", "fit it to 9:16"), ("look", "tools/call look"),
+                           ("cut", "ran auto_cut.py a.mp4"), ("cut", "ran jump_cut.py a.mp4"),
+                           ("cut", "ran pre-cut.py a.mp4"), ("cut", "wrote cut.mp4"), ("cut", "read cut-list.txt"),
+                           ("cut", "deleted cut.pyc"), ("render", "inspected render.pycache"),
+                           ("cut", "mcp__ffmpeg-skill__cut_list"), ("cut", "mcp__ffmpeg-skill__auto_cut"),
+                           ("cut.py", "ran scripts/shortcut_cut.py a.mp4"), ("cut.py", "ran x.cut.py")):
+            task = {"id": 9, "request": "r", "expect": [slot], "grader_expect": None, "grader_not": None}
+            self.assertFalse(run.score(text, task)[0], f"{slot!r} in {text!r}")
+        # a flag slot is the whole flag: a longer flag that starts with it does not fill it
+        for slot, text in (("--keep-alpha", "fit.py --keep-alpha-matte"), ("--list", "join.py --list-formats"),
+                           ("--dry-run", "cut.py a.mp4 ---dry-run")):
+            task = {"id": 10, "request": "r", "expect": [slot], "grader_expect": None, "grader_not": None}
+            self.assertFalse(run.score(text, task)[0], f"{slot!r} in {text!r}")
+        self.assertTrue(run.score("fit.py --keep-alpha=1", {"id": 11, "request": "r", "expect": ["--keep-alpha"],
+                                                          "grader_expect": None, "grader_not": None})[0])
 
     def test_score_grader_expect_regex_must_match(self):
         run = self.evals_run

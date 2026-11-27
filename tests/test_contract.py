@@ -940,14 +940,11 @@ class ContractTests(unittest.TestCase):
         """4.0.1 was not published: 4.0.0 was bumped by hand, its section sat on top of
         CHANGELOG.md with no `## Unreleased` above it, and the bump step of the next release
         asserted on the missing heading. The step's own lines are run here on both shapes."""
-        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-        start = release.index('          m = re.search(r"## Unreleased')
-        step = textwrap.dedent(release[start:release.index("          changelog_path.write_text(changelog", start)])
-        def bumped(changelog):
-            scope = {"re": re, "changelog": changelog, "old": "4.0.0",
-                     "section": "## 4.0.1\n\n_Automated release: since 4.0.0._\n\n- fix: one\n\n"}
-            exec(step, scope)
-            return scope["changelog"]
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("changelog_fragments", ROOT / ".github" / "scripts" / "changelog_fragments.py")
+        frag = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(frag)
+        bumped = lambda changelog: frag.assemble(changelog, [], "4.0.1", "4.0.0", "- fix: one")
         head = "# Changelog\n\n> note\n\n"
         after_a_hand_bump = bumped(head + "## 4.0.0\n\nThe third break.\n\n## 3.15.1\n\nold\n")
         self.assertEqual(re.findall(r"(?m)^## (\S+)", after_a_hand_bump), ["Unreleased", "4.0.1", "4.0.0", "3.15.1"])
@@ -1530,8 +1527,8 @@ import fit
 replacement = sys.argv.pop(1)
 sys.argv[0] = "fit.py"
 real_probe = fit.probe
-def probe_then_replace(path, role="input"):
-    measured = real_probe(path, role)
+def probe_then_replace(path, role="input", **kwargs):
+    measured = real_probe(path, role, **kwargs)
     if role == "input":
         shutil.copyfile(replacement, path)
     return measured
@@ -1648,6 +1645,8 @@ sys.exit(fit.main())
         log = sh("git", "log", f"{last_tag}..HEAD", "--format=%B----COMMIT----", cwd=ROOT, check=False).stdout
         closed = sorted(set(int(n) for n in re.findall(r"(?im)^closes\s+#(\d+)\.?\s*$", log)))
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        for fragment in sorted((ROOT / "changelog.d").glob("*.md")):  # not yet folded in by the release (#678)
+            changelog += fragment.read_text(encoding="utf-8")
         missing = [n for n in closed if f"#{n}" not in changelog]
         self.assertEqual(missing, [], f"issue(s) closed since {last_tag} but not mentioned in CHANGELOG.md: {missing}")
 
@@ -2022,6 +2021,26 @@ sys.exit(fit.main())
         # a direct push has no PR by SHA either, and keeps the title rules
         v, d = rv.resolve("1.0.3", ["docs: typo", "Fix by direct push"], labels({}), ["c", "d"], lambda sha: None)
         self.assertEqual((v, [x["bump"] for x in d]), ("1.0.4", [None, "patch"]))
+        # A PR merged with a merge commit is that one commit, not its branch's: the branch commit
+        # "... (#453)" named an issue, and asking for PR 453's labels stopped every release after
+        # 4.7.1. The real git log, on a throwaway repository.
+        import tempfile
+        with tempfile.TemporaryDirectory() as repo:
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                       GIT_COMMITTER_EMAIL="t@t")
+            git = lambda *a: subprocess.run(["git", "-C", repo, *a], env=env, check=True, capture_output=True)
+            git("init", "-q", "-b", "main")
+            git("commit", "-q", "--allow-empty", "-m", "base")
+            git("tag", "v1.0.0")
+            git("checkout", "-q", "-b", "topic")
+            git("commit", "-q", "--allow-empty", "-m", "feat: x (#453)")
+            git("checkout", "-q", "main")
+            git("merge", "-q", "--no-ff", "topic", "-m", "Merge pull request #715 from o/topic")
+            git("commit", "-q", "--allow-empty", "-m", "fix: y (#716)")
+            subjects = [s for _, s in rv._main_commits("v1.0.0..HEAD", cwd=repo)]
+        self.assertEqual(subjects, ["fix: y (#716)", "Merge pull request #715 from o/topic"])
+        self.assertIn('"--first-parent", rev_range', (ROOT / ".github" / "workflows" / "release.yml").read_text(),
+                      "the release notes list main's commits too, not a merged branch's")
 
     def test_release_version_resolver_does_not_depend_on_a_pr_title(self):
         """3.13.2 (2026-11-19): four PRs titled without a fix/feat prefix carried only `chore`
@@ -2188,6 +2207,17 @@ sys.exit(fit.main())
             self.assertEqual(_common.matrix_chain(meta(color_space="smpte170m"), meta()), "")
         finally:
             _common.STATE.codec, _common.STATE.hw = saved
+
+    def test_mix_color_chains_accepts_missing_metadata(self):
+        """An input that was not probed is accepted just as by matrix_chain."""
+        tagged = {"video": {"color_space": "bt709"}}
+        self.assertEqual(_common.mix_color_chains([None, {}], None), ["", ""])
+        self.assertEqual(_common.mix_color_chains([None, {}], None, draws_colour=True),
+                         [_common.label_chain(None, None), _common.label_chain({}, None)])
+        self.assertEqual(_common.mix_color_chains([tagged, None], None),
+                         [_common.matrix_chain(tagged, None), _common.label_chain(None, None)])
+        self.assertEqual(_common.mix_color_chains([None, tagged], None),
+                         [_common.label_chain(None, None), _common.matrix_chain(tagged, None)])
 
     def test_fold_bt709_matrix_into_the_tools_graph(self):
         """run() moves the encoder line's conversion -vf into the tool's own graph, first: with no
@@ -2431,9 +2461,9 @@ sys.exit(fit.main())
         # 2026-11-22 (#420, the owner's request): +500 each for audio.py's three --track options (about 505 bytes
         # in the listing; the full profile had 50 bytes of room, the default 250)
         profiles = (
-            ({}, 12, 73_500),
-            ({"FFMPEG_SKILL_MCP_FULL": "1"}, 42, 196_000),  # +500 more for color.py --source-alpha-mode (#453)
-            ({"FFMPEG_SKILL_MCP_TOOLS": "probe,cut,fit,export,check"}, 5, 25_000),
+            ({}, 12, 75_000),  # +150 for check.py --expect-audio-changed (#442), +650 for cut.py --words and its five options (#449), +200 for check.py --expect-removed (#442, 162 bytes), +500 for fit.py --zoom and its three options (#647, 74913 measured)
+            ({"FFMPEG_SKILL_MCP_FULL": "1"}, 42, 196_600),  # +500 more for color.py --source-alpha-mode (#453), +200 for check.py --expect-removed (#442), +400 for fit.py --zoom (#647, 196549 measured)
+            ({"FFMPEG_SKILL_MCP_TOOLS": "probe,cut,fit,export,check"}, 5, 26_300),  # +600 for the same and check.py --expect-audio-changed (#442, #449), +200 for --expect-removed (#442), +500 for fit.py --zoom (#647, 26194 measured)
         )
         for env, count, limit in profiles:
             with self.subTest(env=env), unittest.mock.patch.dict(os.environ, env):
@@ -3304,6 +3334,41 @@ sys.exit(fit.main())
             else:
                 self.assertEqual(proc.returncode, 0, (banner, proc.stderr))
 
+    def test_a_build_outside_the_tested_majors_is_said_once_and_the_run_goes_on_556(self):
+        """#556: an ffprobe that reports a future major, a git build or an unreadable version adds one
+        ffmpeg_version_untested warning (build release / git / unknown) and the run succeeds; a tested
+        major adds none. The tested range follows the FFmpeg versions the CI workflow installs."""
+        from _common import runner
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        majors = {6 if "Ubuntu 24.04 apt = 6.1" in ci else None, 7 if "ffmpeg 7.1 apt" in ci else None,
+                  8 if "Homebrew = 8.x" in ci else None, int(re.search(r"choco install ffmpeg --version (\d+)\.", ci).group(1))}
+        self.assertEqual((min(majors - {None}), max(majors - {None})), runner.TESTED_FFMPEG_MAJORS, majors)
+        if os.name == "nt":
+            self.skipTest("the ffprobe shim is a POSIX shell script")
+        src = self.out("tested_src.mp4")
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=64x48:d=1", src)
+        real = shutil.which("ffprobe")
+        cases = (("ffprobe version 9.0.2 Copyright", None), ("ffprobe version 6.1.1-3ubuntu5 Copyright", None),
+                 ("ffprobe version 10.0 Copyright", ("10.0", "release")),
+                 ("ffprobe version N-12345-gabcdef Copyright\nlibavutil      60. 3.100 / 60. 3.100", ("8", "git")),
+                 ("ffprobe version N-12345-gabcdef Copyright", (None, "unknown")))
+        for n, (banner, want) in enumerate(cases):
+            shim = self.out(f"tested_shim_{n}")
+            shim.mkdir(exist_ok=True)
+            (shim / "ffprobe").write_text(f'#!/bin/sh\nif [ "$1" = "-version" ]; then printf "{banner}\\n"; exit 0; fi\nexec "{real}" "$@"\n', encoding="utf-8")
+            (shim / "ffprobe").chmod(0o755)
+            env = dict(os.environ, PATH=str(shim) + os.pathsep + os.environ["PATH"])
+            proc = subprocess.run([sys.executable, str(SCRIPTS / "cut.py"), str(src), "--start", "0", "--end", "0.5", "--json",
+                                   "-o", str(self.out(f"tested_out_{n}.mp4"))], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, (banner, proc.stderr))
+            found = [w for w in json.loads(proc.stdout).get("diagnostics", {}).get("warnings", []) if w["code"] == "ffmpeg_version_untested"]
+            if want is None:
+                self.assertEqual(found, [], banner)
+                continue
+            self.assertEqual(len(found), 1, (banner, found))
+            self.assertEqual((found[0]["version"], found[0]["build"], found[0]["tested"]), (*want, "6.x-9.x"), banner)
+            self.assertEqual(proc.stderr.count("not covered by the test suite"), 1, proc.stderr)
+
     def test_doctor_checks_ffprobe_against_the_floor_too(self):
         """requirements name ffprobe >= 6.1 as well: an old ffprobe beside a 6.1 ffmpeg is unsupported."""
         from unittest import mock
@@ -3364,13 +3429,13 @@ sys.exit(fit.main())
         text, a test over every tool). `mechanism: null` needs `why_none`, and a class gets that
         answer once: the second defect of a class with no mechanism behind it is the evidence
         that the mechanism is what has to change."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("defect_ledger", ROOT / ".github" / "scripts" / "defect_ledger.py")
+        ledger = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ledger)
         seen_without = {}
-        path = ROOT / "docs" / "defect-ledger.jsonl"
-        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
-            entry = json.loads(line)
-            where = f"{path.name}:{n}"
+        for entry in ledger.rows(ROOT):
+            where = n = entry.pop("_where")
             for key in ("date", "issue", "class", "what", "escaped", "mechanism"):
                 self.assertIn(key, entry, where)
             self.assertIn(entry["class"], self.DEFECT_CLASSES, where)
@@ -3382,6 +3447,139 @@ sys.exit(fit.main())
                              f"{where}: class {entry['class']!r} already had a defect closed with no mechanism "
                              f"(line {seen_without.get(entry['class'])}); this one changes the mechanism")
             seen_without[entry["class"]] = n
+
+    def test_two_fixes_add_ledger_entries_without_a_conflict_678(self):
+        """#678: every fix appended a line to docs/defect-ledger.jsonl, so two open fixes always
+        conflicted in its last line, and external PRs (a fork's branch the maintainer cannot push
+        to) stalled each time main moved. An entry is a file under docs/defect-ledger/: two
+        branches that each add one merge with no conflict, and the ledger reader and revert_proof
+        find the entry a change adds, as a file or as a line a branch opened before the split
+        still adds to the .jsonl."""
+        import importlib.util
+        import tempfile
+        spec = importlib.util.spec_from_file_location("defect_ledger", ROOT / ".github" / "scripts" / "defect_ledger.py")
+        ledger = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ledger)
+        entry = lambda n: json.dumps({"date": "2026-11-26", "issue": n, "class": "claim", "what": "w", "escaped": "e", "mechanism": "m"})
+        with tempfile.TemporaryDirectory() as repo:
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            run = lambda *a: subprocess.run(["git", "-C", repo, *a], env=env, check=True, capture_output=True, text=True).stdout
+            root = Path(repo)
+            (root / "docs" / "defect-ledger").mkdir(parents=True)
+            (root / ledger.LEGACY).write_text(entry(1) + "\n", encoding="utf-8")
+            run("init", "-q", "-b", "main"); run("add", "-A"); run("commit", "-q", "-m", "base")
+            for n in (2, 3):
+                run("checkout", "-q", "-b", f"fix{n}", "main")
+                (root / ledger.DIR).mkdir(exist_ok=True)  # git keeps no empty directory
+                (root / ledger.DIR / f"2026-11-26-{n}.json").write_text(entry(n) + "\n", encoding="utf-8")
+                run("add", "-A"); run("commit", "-q", "-m", f"fix: {n}")
+            self.assertEqual([e["issue"] for e in ledger.added(run, "main", "fix2")], [2])
+            run("checkout", "-q", "fix2")
+            run("merge", "-q", "--no-edit", "fix3")  # check=True: a conflict fails here
+            self.assertEqual([e["issue"] for e in ledger.rows(root)], [1, 2, 3])
+            # a branch opened before the split adds its line to the .jsonl: that is an entry too
+            run("checkout", "-q", "-b", "old", "main")
+            with open(root / ledger.LEGACY, "a", encoding="utf-8") as fh:
+                fh.write(entry(4) + "\n")
+            run("commit", "-q", "-am", "fix: 4")
+            self.assertEqual([e["issue"] for e in ledger.added(run, "main", "old")], [4])
+        self.assertTrue((ROOT / ledger.DIR).is_dir(), "the repository keeps its entries under docs/defect-ledger/")
+
+    def test_a_fix_pr_says_what_was_swept_in_its_siblings_section(self):
+        """AGENTS.md asks a fix's PR to say what was swept for the same defect elsewhere, and the
+        template has a `## Siblings` section for it, but nothing checked it, so a fix from inside or
+        outside could land with the sweep skipped. The section, with the template's comment
+        removed, is not empty and names the command that was run; a PR that is not a fix is not
+        judged."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("siblings_section", ROOT / ".github" / "scripts" / "siblings_section.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        template = (ROOT / ".github" / "pull_request_template.md").read_text(encoding="utf-8")
+        self.assertIn("## Siblings", template)
+        self.assertEqual(mod.problem(template), "the `## Siblings` section is empty",
+                         "the template as it stands, its comment only, is an empty section")
+        self.assertIn("no `## Siblings` section", mod.problem("## Summary\n\nfixed it\n"))
+        self.assertIn("names no command", mod.problem("## Siblings\n\nI looked around, nothing else.\n## Notes\n"))
+        swept = ("## Summary\r\n\r\nx\r\n\r\n## Siblings\r\n\r\nClass: a zero replaced by a default. "
+                 "`python3 tests/edge_values.py --json`: 107 ran, none other.\r\n")
+        self.assertIsNone(mod.problem(swept))
+        # the command must sit in this section, not in a later one
+        self.assertIsNotNone(mod.problem("## Siblings\n\nnone\n\n## Test plan\n\n`python3 -m unittest`\n"))
+        script = ROOT / ".github" / "scripts" / "siblings_section.py"
+        def run(title, body):
+            env = {**os.environ, "PR_BODY": body}
+            return subprocess.run([sys.executable, str(script), "--title", title], env=env, capture_output=True, text=True).returncode
+        self.assertEqual(run("fix: something", template), 1)
+        self.assertEqual(run("fix(color): something", swept), 0)
+        self.assertEqual(run("docs: something", template), 0, "a PR that is not a fix is not judged")
+        workflow = (ROOT / ".github" / "workflows" / "siblings.yml").read_text(encoding="utf-8")
+        self.assertIn("edited", workflow, "an edit of the body runs the check again")
+        self.assertIn("PR_BODY: ${{ github.event.pull_request.body }}", workflow)
+        self.assertNotIn("$PR_BODY", workflow, "the body reaches the script through the environment, never a shell word")
+
+    def test_changelog_fragments_678(self):
+        """#678: every PR edited `## Unreleased`, so two open PRs always conflicted there. A change
+        is a file under changelog.d/ that starts with its section heading; the release folds them
+        into the new version's section (Fixed / Added / Changed, then the generated bullets), with
+        whatever a branch opened before the split still wrote under `## Unreleased`, and deletes
+        them. Two branches that each add one merge with no conflict, and revert_proof counts a
+        `### Fixed` fragment as a fix the way it counts a `+- ` line in CHANGELOG.md."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("changelog_fragments", ROOT / ".github" / "scripts" / "changelog_fragments.py")
+        frag = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(frag)
+        # the shape of a real release: 4.8.0's section is the automated line, `### ` groups, then bullets
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        real = re.search(r"(?m)^## 4\.8\.0\n.*?(?=^## )", changelog, re.S).group(0)
+        self.assertRegex(real, r"(?s)^## 4\.8\.0\n\n_Automated release: .*?_\n\n### Fixed\n\n.*### Added\n\n.*\n- ci: ")
+        head = "# Changelog\n\n> note\n\n"
+        legacy = "### Changed\n\n- **Old branch.** Wrote under Unreleased (#1)."
+        out = frag.assemble(
+            head + "## Unreleased\n\n" + legacy + "\n\n## 4.8.0\n\nprev\n",
+            [("b.md", "### Added\n\n- **New flag** (#3).\n"), ("a.md", "### Fixed\n\n- Fix one (#2).\n  More.\n"),
+             ("c.md", "### Fixed\n- Fix two (#4).\n")],
+            "4.9.0", "4.8.0", "- fix: one (#2)\n- feat: two", "\n\nCloses: #2, #3")
+        self.assertEqual(out, head + "## Unreleased\n\n(nothing yet)\n\n## 4.9.0\n\n"
+                         "_Automated release: version and notes generated from pull requests merged since 4.8.0._\n\n"
+                         + legacy + "\n\n### Fixed\n\n- Fix one (#2).\n  More.\n- Fix two (#4).\n\n"
+                         "### Added\n\n- **New flag** (#3).\n- fix: one (#2)\n- feat: two\n\nCloses: #2, #3\n\n## 4.8.0\n\nprev\n")
+        self.assertEqual(re.findall(r"(?m)^### (\w+)", out.split("## 4.8.0")[0]), ["Changed", "Fixed", "Added"])
+        # no fragment, no legacy text: today's output; a headingless fragment is kept, under Changed
+        self.assertIn("since 4.8.0._\n\n- fix: one\n\n", frag.assemble(head + "## Unreleased\n\n(nothing yet)\n\n## 4.8.0\n", [], "4.9.0", "4.8.0", "- fix: one"))
+        self.assertIn("### Changed\n\nloose note", frag.assemble(head + "## 4.8.0\n", [("x.md", "loose note\n")], "4.9.0", "4.8.0", "- b"))
+        # the shipped CHANGELOG.md and fragments: every fragment names its section
+        for path in (ROOT / "changelog.d").glob("*.md"):
+            if path.name != "README.md":
+                self.assertIn(frag.split_fragment(path.read_text(encoding="utf-8"))[0], frag.SECTIONS, path.name)
+        with tempfile.TemporaryDirectory() as repo:
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            run = lambda *a: subprocess.run(["git", "-C", repo, *a], env=env, check=True, capture_output=True, text=True).stdout
+            root = Path(repo)
+            (root / "docs" / "defect-ledger").mkdir(parents=True)
+            (root / "changelog.d").mkdir()
+            (root / "CHANGELOG.md").write_text(head + "## Unreleased\n\n(nothing yet)\n\n## 4.8.0\n\nprev\n", encoding="utf-8")
+            (root / "changelog.d" / "README.md").write_text("format\n", encoding="utf-8")
+            (root / "docs" / "defect-ledger" / "README.md").write_text("ledger\n", encoding="utf-8")
+            run("init", "-q", "-b", "main"); run("add", "-A"); run("commit", "-q", "-m", "base")
+            for n, section in ((2, "Fixed"), (3, "Added")):
+                run("checkout", "-q", "-b", f"b{n}", "main")
+                (root / "changelog.d" / f"{n}.md").write_text(f"### {section}\n\n- Change {n}.\n", encoding="utf-8")
+                (root / "docs" / "defect-ledger" / f"2026-11-26-{n}.json").write_text("{}\n", encoding="utf-8")
+                run("add", "-A"); run("commit", "-q", "-m", f"change {n}")
+            self.assertTrue(frag.adds_fix(run, "main", "b2"))
+            self.assertFalse(frag.adds_fix(run, "main", "b3"), "an Added fragment is not a fix")
+            run("checkout", "-q", "b2")
+            run("merge", "-q", "--no-edit", "b3")  # check=True: a conflict fails here
+            self.assertEqual(sorted(p.name for p in (root / "changelog.d").glob("[0-9]*.md")), ["2.md", "3.md"])
+            # the release step's own call, on this copy: the fragments move into the section and are deleted
+            got = frag.assemble((root / "CHANGELOG.md").read_text(encoding="utf-8"), frag.take_fragments(root / "changelog.d"),
+                                "4.9.0", "4.8.0", "- chore: x")
+            self.assertIn("### Fixed\n\n- Change 2.\n\n### Added\n\n- Change 3.\n- chore: x\n\n## 4.8.0", got)
+            self.assertEqual(sorted(p.name for p in (root / "changelog.d").iterdir()), ["README.md"])
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("take_fragments", release)
+        self.assertIn("git add -A changelog.d", release)
 
     def test_the_632_scripts_read_what_a_change_did(self):
         """Review of #635. revert_proof.changed_tests takes a test whose body alone changed (the
@@ -3932,7 +4130,7 @@ sys.exit(fit.main())
         JPEG are converted to BT.709 by every tool that re-encodes them; a still composited over the
         video (overlay --image) is converted at the end of its own chain, and an untagged main labelled
         BT.709 for it; grid.py converts each cell by its own tags and labels an untagged cell only
-        beside a converted one. A grid of untagged/BT.709 clips plans exactly what it did."""
+        beside a converted or already BT.709 cell. Two untagged cells need no label."""
         s601 = SHARED_OUT / "c_source601.mp4"
         if not s601.exists():
             ffmpeg("-i", self.src, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-x264-params",
@@ -3965,7 +4163,10 @@ sys.exit(fit.main())
             ("waveform", [self.src, "--image", png], {"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p": 1}),
             ("grid", [self.src, s601, "--cols", "2", "--rows", "1"], {"colorspace=ispace=smpte170m:": 1, label: 1}),
             ("grid", [s601, self.src, png, s709, "--cols", "2", "--rows", "2"], {"colorspace=ispace=smpte170m:": 1, label: 1, rgb: 1}),
-            ("grid", [self.src, s709, "--cols", "2", "--rows", "1"], {"colorspace=": 0, "out_color_matrix": 0, "setparams": 0}),
+            ("grid", [self.src, s709, "--cols", "2", "--rows", "1"], {label: 1, "colorspace=ispace": 0, "out_color_matrix": 0}),
+            ("grid", [s709, self.src, "--cols", "2", "--rows", "1"], {label: 1, "colorspace=ispace": 0, "out_color_matrix": 0}),
+            ("grid", [self.src, self.src, "--cols", "2", "--rows", "1"], {"colorspace=": 0, "out_color_matrix": 0, "setparams": 0}),
+            ("grid", [s709, s709, "--cols", "2", "--rows", "1"], {"colorspace=": 0, "out_color_matrix": 0, "setparams": 0}),
         ]
         for n, (name, args, want) in enumerate(cases):
             with self.subTest(tool=name, args=[Path(str(a)).name for a in args]):
@@ -4895,11 +5096,11 @@ sys.exit(fit.main())
         self.assertTrue(doc["edit_list"])
 
     def test_verified_reports_what_the_tool_measured(self):
-        """#189 C: every success document carries `verified` and `verification`. cut: probe and its streams;
+        """#189 C: every success document carries `verified` and `verification`. cut: probe, a copy's keyframe span and its streams;
         loudness: probe + its own after-write measurements (level, and since 2.20 length); export on a raw source: loudness step
         not ok -> verified false while status stays completed; --dry-run verified nothing."""
         doc = json.loads(tool("cut", self.src, "--start", "0", "--end", "1", "-o", self.out("vf_cut.mp4"), "--json").stdout)
-        self.assertEqual((doc["verified"], [(s["step"], s["ok"]) for s in doc["verification"]]), (True, [("probe", True), ("streams", True), ("stream_lengths", True), ("decode", True)]))
+        self.assertEqual((doc["verified"], [(s["step"], s["ok"]) for s in doc["verification"]]), (True, [("probe", True), ("copy_span", True), ("streams", True), ("stream_lengths", True), ("decode", True)]))
         doc = json.loads(tool("loudness", self.src, "-o", self.out("vf_loud.mp4"), "--json").stdout)
         self.assertTrue(doc["verified"]); self.assertEqual([s["step"] for s in doc["verification"]], ["probe", "loudness", "duration"])
         self.assertEqual(doc["verification"][1]["target_lufs"], -14)
@@ -10564,6 +10765,45 @@ class Issue415Tests(unittest.TestCase):
         # an input that is not there yet (a dry run's planned file) counts as having the stream
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             _check_container_codecs(line(d / "not_written_yet.mkv"))
+
+    def test_an_mxf_output_of_a_reencode_is_refused_before_ffmpeg_runs(self):
+        """#736: MXF takes PCM sound only, so every tool's AAC line failed in the muxer after the
+        encode started ("Codec 'aac' is not supported by the bitstream filter 'pcm_rechunk'",
+        nothing written) and a dry run said completed; the H.264 line writes dts the muxer
+        rejects on a read-back. Refused now through the one check every command passes, real and
+        dry run alike, for the three cut modes and the tools of the sweep that broadcast masters
+        meet; a stream copy of the same MXF still writes a decodable file with its PCM sound."""
+        d = self.dir("mxf_out")
+        mxf = d / "in.mxf"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=5", "-f", "lavfi", "-i", "sine=r=48000:d=5",
+               "-c:v", "mpeg2video", "-g", "12", "-bf", "0", "-c:a", "pcm_s16le", "-timecode", "01:00:00:00", mxf)
+        for name, argv in (("cut", ["--start", "1.5", "--end", "3", "--accurate"]),
+                           ("cut", ["--start", "1.5", "--end", "3", "--smart"]),
+                           ("fit", ["--duration", "2.5", "--method", "speed"]), ("color", ["--correct", "--contrast", "1.1"]),
+                           ("loudness", []), ("audio", ["--voice", "light"]), ("export", ["--preset", "youtube"])):
+            for dry in ((), ("--dry-run",)):
+                with self.subTest(tool=name, argv=argv, dry=bool(dry)):
+                    out = d / f"{name}.mxf"
+                    doc = json.loads(tool(name, mxf, *argv, *dry, "-o", out, "--json", check=False).stdout)
+                    self.assertEqual(doc["status"], "failed")
+                    err = doc["error"]
+                    self.assertEqual((err["kind"], err["reason"]), ("input", "output_container_codecs"), err)
+                    self.assertEqual(err["details"]["container"], "mxf")
+                    self.assertTrue(err["details"]["encoders"])
+                    self.assertIn(".mov", err["hint"])
+                    self.assertFalse(out.exists())
+        # a stream copy still writes a decodable MXF with its PCM sound: one range, and a removal whose
+        # parts land on keyframes (a copy join since #739 reads the MXF keyframes right)
+        for name, argv in (("copy", ["--start", "1.5", "--end", "3"]), ("remove", ["--remove", "1-2"])):
+            with self.subTest(copy=name):
+                kept = d / f"{name}.mxf"
+                doc = json.loads(tool("cut", mxf, *argv, "-o", kept, "--json").stdout)
+                self.assertEqual((doc["status"], doc.get("mode")), ("completed", "copy"))
+                probed = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
+                                         "-of", "csv=p=0", str(kept)], capture_output=True, text=True)
+                self.assertEqual(probed.stdout.strip(), "pcm_s16le")
+                decoded = subprocess.run(["ffmpeg", "-v", "error", "-i", str(kept), "-f", "null", "-"], capture_output=True, text=True)
+                self.assertEqual(decoded.stderr.strip(), "")
 
     def test_waveform_title_dry_run_says_its_planned_sizes_are_placeholders(self):
         """The dry run plans the title on a render it did not write: fontsize 0 in the plan,

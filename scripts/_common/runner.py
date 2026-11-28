@@ -150,7 +150,7 @@ def _probe_limit() -> float:
 
 def _ffprobe(*args: str) -> "subprocess.CompletedProcess[str]":
     # every short ffprobe question this module asks: text out, stderr dropped, the probe time limit
-    return subprocess.run([found_exe("ffprobe"), *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    return subprocess.run(guard_input_protocols([found_exe("ffprobe"), *args]), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                           encoding="utf-8", errors="replace", timeout=_probe_limit())
 
 
@@ -400,7 +400,7 @@ class Context:
                  "notes", "warnings", "fallbacks", "skipped", "audit_log", "stage_verification", "first_input", "audio_inputs", "video_inputs",
                  "source_timecode", "smpte_hint", "delivered", "expected_timecode", "time_mapped", "watched", "temp_dirs", "side_deliveries",
                  "_stream_copy_outputs", "_encoded_media", "measured_plan_inputs", "plan_generated_inputs",
-                 "sequence_frames_sha256")
+                 "sequence_frames_sha256", "encode_policy")
 
     def __init__(self) -> None:
         self.reset()
@@ -437,6 +437,7 @@ class Context:
         self.plan_generated_inputs: set[str] = set()  # temporary inputs reconstructed by the tool
         self.sequence_frames_sha256: Optional[str] = None
         self.measured_plan_inputs: Dict[str, Dict[str, Any]] = {}  # fingerprints taken before plan measurements
+        self.encode_policy: Dict[str, Any] = {}      # $FFMPEG_SKILL_ENCODE as read, plus `applied` (#576); {} when unset or not for this tool
         self.codec: Optional[str] = None             # --codec: encoder for the re-encode (None = x264 for SDR, x265 for HDR)
         self.alpha_line: Optional[str] = None        # --keep-alpha / --transparent: the alpha line written (_common.alpha.ALPHA_CODECS)
         self.hw = False                              # --hw / $FFMPEG_SKILL_HW: VideoToolbox encoders where they apply
@@ -497,11 +498,16 @@ def _teach(ap: "argparse.ArgumentParser", message: str = "") -> str:
             tools = sorted(n for n in os.listdir(here) if n[0] != "_" and n.endswith(".py") and f'"{flag}"' in open(os.path.join(here, n), encoding="utf-8").read())
             tips += (f"\n{flag} is not an option of this tool" + (f"; did you mean {' or '.join(near)}?" if near else "") + (f"; {' and '.join(said)} mention '{word}'" if said else "")
                      + (f" ({', '.join(tools)} take {flag})" if tools else ""))
-            fix[flag] = (near + said)[0] if len(near + said) == 1 else None
+            # an answer is one option spelt like a flag no tool takes (in its own file or a shared one): another tool's flag, an
+            # option sharing a word or one the help mentions mean something else (speedramp --ramp 3:6:0.5 is not --segment 3:6:0.5)
+            taken = tools or [n for n in os.listdir(os.path.join(here, "_common")) if n.endswith(".py") and f'"{flag}"' in open(os.path.join(here, "_common", n), encoding="utf-8", errors="replace").read()]
+            fix[flag] = (near + said)[0] if len(near + said) == 1 and not taken and difflib.get_close_matches(flag, near, 1, 0.85) else None
     # a choice with one near neighbour or a common other word for it, and a number written with its unit (-30dB, 0.8s, 1080px)
     wrong = re.search(r"invalid choice: '([^']+)' \(choose from (.*)\)", message)
     if wrong:
-        fix[wrong[1]] = (difflib.get_close_matches(_OTHER_WORDS.get(wrong[1].lower(), wrong[1]), [c.strip(" '") for c in wrong[2].split(",")], 1, 0.6) or [None])[0]
+        # the other word only when it is a choice: strong is high, never the platform nearest to 'high' (ig); Python 3.13 drops the quotes
+        choices = [c.strip(" '") for c in wrong[2].split(",")]
+        fix[wrong[1]] = _OTHER_WORDS[wrong[1].lower()] if _OTHER_WORDS.get(wrong[1].lower()) in choices else (difflib.get_close_matches(wrong[1], choices, 1, 0.6) or [None])[0]
     words: List[str] = []
     for a in ([] if None in fix.values() else sys.argv[1:]):
         name, eq, rest = a.partition("=")
@@ -643,14 +649,16 @@ def apply_common(args: "argparse.Namespace") -> None:
         env_limit, env_problem = _read_env_timeout()
         if env_problem:
             warn(env_problem, "timeout_env_invalid", value=os.environ.get("FFMPEG_SKILL_TIMEOUT"), timeout=env_limit)
-    # one step for every number a tool takes (#645): the range its help states as a..b is the range it
-    # takes, a negative needs a help that names one, and nothing but a sample count is past a million
+    # one step for every number a tool takes (#645): the range its help states as a..b or "> 0" (#749)
+    # is the range it takes, a negative needs a help that names one, and nothing but a sample count is past a million
     for a in getattr(getattr(STATE, "parser", None), "_actions", ()):
         v, text = getattr(args, a.dest, None), a.help or ""
-        span = re.search(r"(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)", text)
+        span = re.search(r"(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)|> 0\b", text)
         if a.type in (int, float) and isinstance(v, (int, float)) and v != a.default and a.dest not in ("timeout", "length_samples") and (
-                not float(span[1]) <= v <= float(span[2]) if span else abs(v) > 1e6 or (v < 0 and not re.search(r"-\d|dB|degree|stops", text))):
+                (not 0 < v <= 1e6 if span[0] == "> 0" else not float(span[1]) <= v <= float(span[2])) if span
+                else abs(v) > 1e6 or (v < 0 and not re.search(r"-\d|dB|degree|stops", text))):
             die(f"{next((o for o in a.option_strings if o in [x.split('=')[0] for x in sys.argv[1:]]), a.option_strings[0])} {v:g} is outside what this option takes" + (f", {span[0]}" if span else ""), hint=text.replace("%%", "%") or None)
+    STATE.encode_policy = _apply_encode_policy(args)
     if STATE.fast and getattr(args, "preset", None) in X264_PRESETS:
         args.preset = "veryfast"
     STATE.codec = getattr(args, "codec", None) or None
@@ -694,6 +702,60 @@ def apply_common(args: "argparse.Namespace") -> None:
     if crf is not None and not 0 <= int(crf) <= top:
         die(f"--crf must be between 0 and {top} ({'SVT-AV1' if STATE.codec == 'av1' else 'x264/x265'} scale; 18 is visually lossless), got {crf}")
     install_signal_handlers()
+
+
+ENCODE_ENV = "FFMPEG_SKILL_ENCODE"
+_ON, _OFF = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
+
+
+def _apply_encode_policy(args: "argparse.Namespace") -> Dict[str, Any]:
+    """$FFMPEG_SKILL_ENCODE (#576), the house settings for the encoder flags, e.g.
+    `codec=h264,quality=18,preset=medium,hw=0,locked`: a flag this call did not give takes the house
+    value (--codec, --quality, an x264 --preset, --hw/--no-hw as $FFMPEG_SKILL_HW would); with `locked`,
+    one given with another value, and --fast where a preset is pinned, is refused before anything runs.
+    Only on a tool with one of those flags; an entry that does not read is refused, never skipped."""
+    acts = {a.dest: a for a in getattr(STATE.parser, "_actions", ()) if a.dest in ("codec", "quality", "hw")
+            or a.dest == "preset" and tuple(a.choices or ()) == X264_PRESETS}
+    text = os.environ.get(ENCODE_ENV, "").strip()
+    if not acts or not text:
+        return {}
+    policy: Dict[str, Any] = {}
+    for item in [s.strip() for s in text.split(",") if s.strip()]:
+        key, _, value = (p.strip().lower() for p in item.partition("="))
+        if (key, value) == ("locked", ""):
+            policy["locked"] = True
+        elif key in ("codec", "preset") and value in (CODECS if key == "codec" else X264_PRESETS):
+            policy[key] = value
+        elif key == "quality" and value.isdigit():
+            policy[key] = int(value)
+        elif key == "hw" and value in _ON + _OFF:
+            policy[key] = value in _ON
+        else:
+            refuse("input", "encode_policy", f"${ENCODE_ENV}: {item!r} is not codec=h264|hevc|av1|prores, quality=N, "
+                   "preset=<x264 preset>, hw=0|1 or locked", hint=f"fix or unset ${ENCODE_ENV}", entry=item)
+    opts = STATE.parser._option_string_actions
+    given = {hit[0].dest for a in sys.argv[1:(sys.argv + ["--"]).index("--")] if a.startswith("--") for name in [a.split("=")[0]]
+             for hit in [[opts[name]] if name in opts else [v for o, v in opts.items() if o.startswith(name)]] if len(hit) == 1}
+    asked = {"codec": getattr(args, "codec", None), "quality": getattr(args, "quality", None),
+             "preset": getattr(args, "preset", None), "hw": hw_flag(args)}
+    for key in [k for k in ("codec", "quality", "preset", "hw") if k in policy and k in acts]:
+        if key in given or (key == "hw" and "no_hw" in given):
+            if policy.get("locked") and asked[key] != policy[key]:
+                flag = ("--hw" if asked[key] else "--no-hw") if key == "hw" else f"--{key} {asked[key]}"
+                refuse("input", "encode_policy", f"{flag} is not the house setting {key}={int(policy[key]) if key == 'hw' else policy[key]} "
+                       f"(${ENCODE_ENV} is locked)", hint=f"leave the flag out, or change ${ENCODE_ENV}", key=key, asked=asked[key], policy=policy[key])
+        elif key == "hw":
+            if os.environ.get(HW_FORCED_ENV) != "1":  # render.py/batch.py --hw|--no-hw chose for their stages
+                os.environ[HW_ENV] = "1" if policy["hw"] else "0"
+        else:
+            setattr(args, key, policy[key])
+    if policy.get("locked") and "preset" in policy and STATE.fast:
+        refuse("input", "encode_policy", f"--fast replaces the house preset {policy['preset']} (${ENCODE_ENV} is locked)",
+               hint=f"leave --fast out, or take preset out of ${ENCODE_ENV}", key="fast", asked=True, policy=policy["preset"])
+    # the keys whose default the house set here (hw: where $FFMPEG_SKILL_HW applies; export.py's presets keep theirs)
+    policy["applied"] = [k for k in ("codec", "quality", "preset", "hw") if k in policy and k in acts and not {k, "no_" + k} & given
+                         and (k != "hw" or getattr(args, "_hw_env", False))]
+    return policy
 
 
 # The child processes this tool is waiting on right now (an ffmpeg, or a sibling script under
@@ -1114,12 +1176,47 @@ def _refuse_url_media(cmd: Sequence[str]) -> None:
         # a file named like an option is still ffprobe's input: guard_input_names() writes it
         # `./name`, so it is checked as a playlist like any other (review of #636)
         _refuse_playlist(last)
+        refuse_outside_roots(last)
     for value in values:
         if looks_like_url(value):
             refuse("input", "media_path_is_url",
                    f"{value!r} would be opened by ffmpeg as a URL ({url_scheme(value)}:), not as a local file; "
                    "this skill reads and writes local files only. Pass a plain path (a local name containing "
                    "a colon works as ./name)", path=value, scheme=url_scheme(value))
+    for i, value in enumerate(values):  # the last value: an ffmpeg command's output, an option's value after an ffprobe -i
+        last_one = i == len(values) - 1 and value == last
+        if not (last_one and base.startswith("ffprobe") and "-i" in cmd[1:-1]):
+            refuse_outside_roots(value, "output" if last_one and base.startswith("ffmpeg") else "input")
+
+
+ROOTS_ENV = "FFMPEG_SKILL_ROOTS"
+_TEMPLATES = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "templates")
+
+
+def _under(real: str, root: str) -> bool:
+    return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def refuse_outside_roots(path: Any, what: str = "input") -> None:
+    """With FFMPEG_SKILL_ROOTS set (os.pathsep-separated absolute directories), refuse a path that
+    does not resolve (symlinks followed) under one of them (#572). The system temp directory, where
+    the tools write their intermediates and pass them between processes, is always allowed, and so
+    is reading the skill's own templates. An entry that is not absolute allows nothing."""
+    raw = os.environ.get(ROOTS_ENV, "")
+    p = str(path)
+    if not raw.strip() or p in ("-", os.devnull) or p.startswith("pipe:"):
+        return
+    import tempfile
+    entries = [e for e in raw.split(os.pathsep) if e.strip()]
+    roots = [os.path.normcase(os.path.realpath(e)) for e in entries if os.path.isabs(e)]
+    real = os.path.normcase(os.path.realpath(p))
+    allowed = roots + [os.path.normcase(os.path.realpath(tempfile.gettempdir()))]
+    if any(_under(real, r) for r in allowed + ([os.path.normcase(os.path.realpath(_TEMPLATES))] if what == "input" else [])):
+        return
+    refuse("input", "path_outside_roots",
+           f"{what} {p!r} resolves to {real!r}, outside the directories {ROOTS_ENV} allows ({os.pathsep.join(roots) or 'none'}); "
+           "move the file under one of them or add its directory to the variable",
+           path=p, resolved=real, roots=roots, ignored=[e for e in entries if not os.path.isabs(e)])
 
 
 def _check_no_overwrite_input(cmd: Sequence[str]) -> None:
@@ -1198,6 +1295,7 @@ def _check_output_path(cmd: Sequence[str]) -> None:
         refuse("input", "media_path_is_url",
                f"output {output!r} would be opened by ffmpeg as a URL, not as a local file; pass a plain path "
                "(a local name containing a colon works as ./name)", path=output, scheme=output.split(":", 1)[0].lower())
+    refuse_outside_roots(output, "output")
     if re.search(r"\.(m3u8?|mpd)$|%0?\d*d[^/\\]*\.(png|jpe?g|bmp|tiff?|webp|dpx|exr|tga|p[pg]m|jp2)$", output, re.I) and "-update" not in cmd:
         # a playlist or a numbered pattern makes ffmpeg write files it names itself (out0.ts,
         # frame001.png): no guard here has seen them, and -y replaced the ones that existed (#562)
@@ -1361,6 +1459,7 @@ def _copies_wma_only(cmd: Sequence[str]) -> bool:
             return False
         probe_cmd = [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-show_entries",
                      "stream=codec_type,codec_name:stream_disposition=attached_pic", "-of", "json", file_arg(path)]
+        probe_cmd = guard_input_protocols(probe_cmd)
         try:
             proc = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                   timeout=_probe_limit())
@@ -1429,6 +1528,7 @@ def _an_input_has(cmd: Sequence[str], kind: str) -> bool:
             return True
         probe_cmd = [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-select_streams", kind,
                      "-show_entries", "stream=index", "-of", "csv=p=0", *input_format_args(path), file_arg(path)]
+        probe_cmd = guard_input_protocols(probe_cmd)
         limit = _probe_limit()  # PROBE_TIMEOUT, or --timeout when that is lower; never unlimited (--timeout 0)
         try:
             proc = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=limit)
@@ -2076,6 +2176,7 @@ def refuse_existing_outputs(paths: Sequence[str]) -> None:
     for output in paths:
         if not output:
             continue
+        refuse_outside_roots(output, "output")
         try:
             exists = os.path.isfile(output)
             real = os.path.realpath(output)
@@ -3595,7 +3696,44 @@ def guard_input_names(cmd: Sequence[str]) -> List[str]:
         for i in range(1, len(cmd) - 1):
             if cmd[i] == "-i":
                 cmd[i + 1] = file_arg(cmd[i + 1])
-    return guard_input_formats(cmd)
+    return guard_input_protocols(guard_input_formats(cmd))
+
+
+# The protocols an input, and every file its demuxer opens (a concat list's entries, an image
+# sequence's frames), may go through (#572). FFmpeg's own default for a local file is
+# file,crypto,data; the skill's commands need file alone (measured over the test suites).
+PROTOCOL_WHITELIST = "file"
+
+
+def guard_input_protocols(cmd: Sequence[str]) -> List[str]:
+    """`cmd` with `-protocol_whitelist PROTOCOL_WHITELIST` first among each input's options (or a
+    value the caller gave replaced): for each `-i` of an ffmpeg or ffprobe command, and for the
+    last argument of an ffprobe command without `-i` when that argument is its input. A second guard
+    behind _refuse_url_media() and _refuse_playlist(), for a URL a demuxer finds inside a file."""
+    cmd = [str(a) for a in cmd]
+    base = os.path.basename(cmd[0]) if cmd else ""
+    if not base.startswith(("ffmpeg", "ffprobe")):
+        return cmd
+    if base.startswith("ffprobe") and "-i" not in cmd[1:-1]:
+        at = {len(cmd) - 1} if len(cmd) > 1 and not cmd[-1].startswith("-") else set()
+    else:
+        at = {i for i in range(1, len(cmd) - 1) if cmd[i] == "-i"}
+    lead = 1  # after the global flags ffmpeg_base() and the probes start with, which stay first
+    while lead < len(cmd) - 1 and (cmd[lead] in ("-hide_banner", "-nostdin", "-y", "-n") or cmd[lead] in ("-v", "-loglevel") and lead + 1 not in at):
+        lead += 2 if cmd[lead] in ("-v", "-loglevel") else 1
+    out: List[str] = cmd[:lead]
+    since = lead  # where the current input's options start in `out`; the list goes first among them
+    for i, a in enumerate(cmd[lead:], start=lead):
+        if i in at:
+            opts = out[since:]
+            if "-protocol_whitelist" in opts[:-1]:
+                out[since + opts.index("-protocol_whitelist") + 1] = PROTOCOL_WHITELIST
+            else:
+                out[since:since] = ["-protocol_whitelist", PROTOCOL_WHITELIST]
+        out.append(a)
+        if i - 1 in at or (i in at and a != "-i"):
+            since = len(out)
+    return out
 
 
 def riff_wave_args(path: str) -> List[str]:
@@ -3945,6 +4083,7 @@ def read_text_or_die(path: str, flag: str) -> str:
     """Read a caller-supplied UTF-8 text file (a cue list, chapters, notes) or fail as kind input
     with the flag named, instead of a FileNotFoundError / UnicodeDecodeError traceback. The text
     comes back through normalize_text(): no BOM, `\\n` line ends."""
+    refuse_outside_roots(path)
     if os.path.isdir(path):
         # checked first: Windows raises PermissionError, not IsADirectoryError, for a directory
         die(f"{flag}: {path} is a directory, not a text file")
@@ -4011,6 +4150,7 @@ _SURROGATE = re.compile("[\ud800-\udfff]")
 def read_json(path: "os.PathLike[str] | str") -> Any:
     """parse_json() of a UTF-8 file. Raises OSError for a file that cannot be read and ValueError
     (UnicodeDecodeError is one) for anything else, so `except (OSError, ValueError)` covers it."""
+    refuse_outside_roots(path)
     with open(path, "r", encoding="utf-8") as fh:
         doc = parse_json(fh.read())
     register_plan_input(path)

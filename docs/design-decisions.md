@@ -75,9 +75,11 @@ exists. When a decision changes, edit the entry in the same PR.
 - [After 3.3.0 — a declared change scope for `check.py --compare` (#439)](#after-330--a-declared-change-scope-for-checkpy---compare-439)
 - [After 4.8.3 — a declared change scope for sound: `--expect-audio-changed` (#442 phase 2)](#after-483--a-declared-change-scope-for-sound---expect-audio-changed-442-phase-2)
 - [After 4.12.0 — a cut checked against the reference with its spans taken out: `--expect-removed` (#442 phase 3)](#after-4120--a-cut-checked-against-the-reference-with-its-spans-taken-out---expect-removed-442-phase-3)
+- [After 4.16.0 — the change scope read from two render.py projects: `--compare-project` (#442 phase 4)](#after-4160--the-change-scope-read-from-two-renderpy-projects---compare-project-442-phase-4)
 - [After 4.13.0 — dropped and repeated frames in `check.py --content` (#574)](#after-4130--dropped-and-repeated-frames-in-checkpy---content-574)
 - [After 4.14.0 — an FFmpeg the test suite does not run is said, not refused (#556)](#after-4140--an-ffmpeg-the-test-suite-does-not-run-is-said-not-refused-556)
 - [After 4.14.0 — a timed zoom on video (#647)](#after-4140--a-timed-zoom-on-video-647)
+- [After 4.14.0 — a protocol allow-list on every input and FFMPEG_SKILL_ROOTS (#572)](#after-4140--a-protocol-allow-list-on-every-input-and-ffmpeg_skill_roots-572)
 - [After 3.3.0 — non-finite numbers are refused in one place](#after-330--non-finite-numbers-are-refused-in-one-place)
 - [After 3.4.3 — the MCP Registry entry is published by the release, not by hand](#after-343--the-mcp-registry-entry-is-published-by-the-release-not-by-hand)
 - [After 3.6.0 — a fold-down, a tone map and an overlay keep the source's levels and depth](#after-360--a-fold-down-a-tone-map-and-an-overlay-keep-the-sources-levels-and-depth)
@@ -134,6 +136,10 @@ exists. When a decision changes, edit the entry in the same PR.
 - [After 4.8.0 — where caption, overlay and graphics drew (#547)](#after-480--where-caption-overlay-and-graphics-drew-547)
 - [After 4.8.0 — a copy is verified against what its keyframes allow (#620)](#after-480--a-copy-is-verified-against-what-its-keyframes-allow-620)
 - [After 4.8.3 — word-timed cuts in cut.py (#449)](#after-483--word-timed-cuts-in-cutpy-449)
+- [After 4.16.0 — materials for a review page: joins to listen to, and the crop window as data (#581)](#after-4160--materials-for-a-review-page-joins-to-listen-to-and-the-crop-window-as-data-581)
+- [After 4.16.0 — house encoder settings (#576)](#after-4160--house-encoder-settings-576)
+- [After 4.18.0 — crop.py folded into fit.py (#683)](#after-4180--croppy-folded-into-fitpy-683)
+- [After 4.19.0 — the change floor surveyed across encoders, and a finer grid: `--change-grid` (#442)](#after-4190--the-change-floor-surveyed-across-encoders-and-a-finer-grid---change-grid-442)
 <!-- contents:end -->
 
 ## Time limits
@@ -3320,9 +3326,15 @@ it had dropped, and nothing could make a transparent canvas to draw one graphic 
   255/128/64/0, premultiplied, graded with `--correct --gamma 1.6` and a LUT): ProRes 4444's
   re-straightened colour is within 0.9 codes of the opaque band's at alpha 128 and 1.7 at 64; qtrle,
   whose grade goes through an 8-bit 4:4:4 working picture, within 1.7 and 2.9, so the test holds
-  it to 3.5. Code:
-  `alpha.unpremultiply_leg()`, `color.main()`. Test:
-  `test_color_source_alpha_mode_premultiplied_grades_the_straight_colour_453`.
+  it to 3.5. The ProRes 4444 leg that keeps the mask at 16 bits converted the graded YUV to RGB
+  with `format=gbrp16le`'s swscale default, BT.601, so on a BT.709-tagged master the whole
+  premultiplied run was written by that matrix while the stream stayed tagged BT.709: an opaque
+  pixel was 181,129,75 where the straight run wrote 177,126,77 (the reporter's LUT, #740). The
+  leg now names the matrix its samples are in (`alpha.wide_merge_leg`, the source's, or the
+  BT.709 an RGB source's YUV line is, #496); an untagged source keeps swscale's default. Code:
+  `alpha.unpremultiply_leg()`, `alpha.wide_merge_leg()`, `color.main()`. Test:
+  `test_color_source_alpha_mode_premultiplied_grades_the_straight_colour_453`,
+  `test_color_source_alpha_mode_premultiplied_on_a_tagged_master_matches_straight_740`.
 - **Compositing is checked against a floor, not an equality.** A layer drawn on the picture adds
   coverage, so the written alpha cannot equal the source's: `graphics.py`/`overlay.py` pass when the
   stream stores an alpha plane, no frame's alpha is below the source's, and the output did not turn
@@ -3672,6 +3684,55 @@ Tests: `SmartCutTests` in `tests/test_cut_copy.py`.
 - **Remaining in #442:** phase 4 (`render.py` deriving the declaration from two project files), the
   floor survey and `--change-grid`.
 
+## After 4.16.0 — the change scope read from two render.py projects: `--compare-project` (#442 phase 4)
+
+- **The declaration comes from the edit, and the check is check.py's.** `render.py NEW.json
+  --compare-project OLD.json` maps each key in which the two projects differ to
+  `--expect-changed`, `--expect-audio-changed` and `--expect-removed` values and runs `check.py
+  --compare` against OLD's own output after the last stage. Phases 1 to 3 measure; this phase only
+  decides what the caller would otherwise have typed, from the project rather than from the
+  agent's account of what it did. Nothing new is measured, so the floors, the tile grid and the
+  "not compared is FAIL" rule are phase 1's to 3's. Code: `render.derive_scope()`,
+  `render.compare_plan()`. Tests:
+  `test_the_declaration_comes_from_the_project_diff_and_is_checked`,
+  `test_whole_file_settings_and_layers_on_their_own_clock_are_declared_whole`,
+  `test_what_no_span_states_is_refused_before_the_first_stage`.
+- **What no span states is refused, before the first stage.** A clip added, removed or re-timed
+  other than a later `in` on the first clip or an earlier `out` on the last, and any change to
+  `transition`, `silence`, `fit`, `frame`, `audiogram` or `snap`, moves frames by an amount only
+  the render knows (a crossfade's offset, a silence cut's measurement, a beat). Declaring a guess
+  would pass or fail on the guess. So the run is refused (`project_diff_not_derivable`, one reason
+  per difference), under `--dry-run` too, and the caller renders without the flag. A refusal costs
+  no encode, and "not compared" was already a FAIL in check.py.
+- **A whole-file setting is the whole stream, not "not derivable".** `audio` and `loudness` change
+  every sample a level is applied to, `brand` and `template` every frame a style reaches, `export`
+  both: the span is the whole file (`0` to the previous render's length), which is true and still
+  holds the other stream to "unchanged". The same for the sound under a trim when an `audio`
+  block, a `loudness` stage or a normalising export is present: a bed starts at the new start and
+  a measured level is measured over a different file.
+- **A layer or cue is its own window, old and new.** An overlay or graphic entry (by index) whose
+  keys other than `start`/`end` differ, or whose window differs, declares both windows; a cue
+  (start, end, text) in one file and not the other declares itself. Caption times are read as
+  caption.py reads them (auto-timed lines 3 s apart, `offset`, at most `min_duration`); an ASS file
+  or inline text cannot be timed without the stage, so it is the whole picture. Files are compared
+  by `batch.file_key()` (a file replaced under its name is a difference).
+- **Under a trim, a layer that moved with the head is unchanged only when it has no clock of its
+  own.** After a head trim of D seconds an entry at `start - D` with the same keys is the same
+  picture over the same frames, unless it is a video layer (its frames run from its start), a
+  graphic with no end (a progress bar fills to the clip's end), a fading whole-clip overlay, or it
+  started before the cut (its animation is part way through). Those are declared.
+- **Windows are closed at both ends, as the stages draw them.** `"end": 2` draws on the frame at
+  2.000 s, and `--expect-removed 0-2` keeps that frame, so a 2 s head trim under an overlay at 1-2 s
+  declares `0.000-0.000`: the new first frame had the overlay and has it no longer. Found by the
+  first test, which FAILed that frame before the end was kept.
+- **Only the two scope rows decide.** check.py is run without a platform, so its format and
+  judgement rows describe the file against youtube's spec; they are kept in `compare_project.check`
+  but `ok` is the `change_scope` and `audio_change_scope` rows. `ok: false` fails the render
+  (`kind: verification`, the file kept), as a failed `"check"` stage does.
+- **No new option beyond the flag** (the freeze; the owner's decision of 2026-11-27 makes #442's
+  phases freeze exceptions): `--compare-project` and the `compare_project` result field. A whole
+  clip removed from a cut list, the floor survey and `--change-grid` remain open in #442.
+
 ## After 4.13.0 — dropped and repeated frames in `check.py --content` (#574)
 
 - **Held to the file's own median step, not its stated rate.** A file with dropped frames states
@@ -3746,6 +3807,59 @@ Tests: `SmartCutTests` in `tests/test_cut_copy.py`.
   a move that ends past it (half a frame of slack), a zero duration, `--zoom-*` without
   `--zoom`, and `--zoom` on a still (`insert.py --zoom` animates one). Test:
   `FitZoomTests.test_fit_zoom_refuses_a_move_it_cannot_make_647`.
+
+## After 4.14.0 — a protocol allow-list on every input and FFMPEG_SKILL_ROOTS (#572)
+
+- **Every input of every ffmpeg and ffprobe command carries `-protocol_whitelist file`.** It is
+  a second guard behind the URL and playlist refusals (`_refuse_url_media()`,
+  `_refuse_playlist()`, above): those decide by the name and the first bytes the skill can see,
+  and a demuxer can still find a name inside a file. The list is added where the input names are
+  already guarded, `runner.guard_input_names()` (which `run()`, `run_analysis()` and the frame
+  readers apply), and `runner.guard_input_protocols()` is applied directly by the short probes
+  that start their own process (`runner._ffprobe()`, the two stream checks inside `runner`,
+  `_review.py`); `pacing.py` no longer passes its own. It goes first among that input's own
+  options (after the leading `-hide_banner`/`-loglevel`/`-nostdin`/`-y`), so an option such as
+  `-ss`, `-f wav` or `-c:v libvpx-vp9` stays right before its `-i`. `file` alone is what the
+  skill's own commands need, measured: the whole suite (`tests/run_parallel.py`, 2021 tests:
+  concat lists, image sequences, `-f lavfi` inputs, two-pass and multi-part cuts) ran with it,
+  no ffmpeg reported "not on whitelist", and the only failures were tests that pinned an argv
+  without it. `-f lavfi` takes it
+  and ignores it; a concat list's entries and an image sequence's frames are opened through the
+  input's own list. What it changes was measured on FFmpeg 6.1.1: a demuxer opened from a local
+  file already inherits `file,crypto,data`, so the allow-list takes away `data:` and `crypto:`
+  (an `-f concat` list with a `data:` entry is read without it and refused with it), and keeps the
+  network protocols out whatever a later FFmpeg's default is. It does not stop a demuxer from
+  reading another *local* file; that is what the playlist refusal is for. Not built here: the
+  AVI/GAB2 case named in #572 (a playlist inside an AVI subtitle stream; FFmpeg's own avidec
+  limits GAB2 to SRT and ASS, which was not measured), and an HLS playlist behind an ID3 tag
+  (6.1 already refuses to probe HLS under a name that is not `.m3u8`: "Not detecting m3u8/hls
+  with non standard extension"). Tests: `test_every_executed_ffmpeg_and_ffprobe_input_carries_the_protocol_whitelist`
+  (stand-ins for ffmpeg and ffprobe on PATH log each process a tool starts),
+  `test_a_file_a_demuxer_opens_from_inside_a_local_input_is_kept_to_the_file_protocol`.
+- **`FFMPEG_SKILL_ROOTS` bounds every input and output to named directories, and is off by
+  default.** Unset, nothing changes. Set (absolute directories, `os.pathsep`-separated), a path
+  that does not resolve under one of them after `os.path.realpath()` is refused, `kind: input`,
+  `error.reason: path_outside_roots`, details `{path, resolved, roots, ignored}`, before ffmpeg
+  runs, dry runs included. An entry that is not absolute allows nothing and is listed in
+  `ignored`, so a mistake narrows what is allowed instead of widening it. One check,
+  `runner.refuse_outside_roots()`, is called where the path guards already are: every input and
+  the output of an ffmpeg/ffprobe command (`_refuse_url_media()`), every output a tool writes
+  itself (`_check_output_path()`, `refuse_existing_outputs()`, so side files, plans and
+  `place_output()` deliveries too), every caller file read as text or JSON (`read_text_or_die()`,
+  `read_json()`: projects, recipes, brands, subtitles, word lists), every concat-list entry
+  (`decision.concat_list_line()`), `color.py --lut`, and the directories and files an
+  orchestrator writes itself (`render.py --work`, `--cache`, `--audit-log`; `batch.py`'s
+  `output_dir` and `--work`). Children started by `render.py`,
+  `batch.py` and `verify.py` inherit the variable and check their own paths. **The system temp
+  directory is always allowed**: the tools write their intermediates there and hand them to
+  child tools, which cannot tell those from a caller's paths; a caller's file in the temp
+  directory is therefore allowed too. Reading the skill's own `templates/` is allowed; writing
+  there is not. `verify.py` runs its steps as tools, so a step refused this way is reported as
+  that step's failure (`kind: verification`), as any failed step is. A font (`--font-file`, `--fonts-dir`, or one fontconfig finds) is not
+  checked, because it is usually a system file outside any media folder. A symlink swapped after
+  the check is outside what one check can close. Tests:
+  `test_ffmpeg_skill_roots_keeps_every_input_and_output_under_the_named_directories` (every tool
+  in `tests/sweep.py`'s table, plus `join`, `render` (an output and a `--work` outside), `batch` (an `output_dir` outside), `sequence` and a `--plan`).
 
 ## After 3.3.0 — non-finite numbers are refused in one place
 
@@ -6581,10 +6695,15 @@ is pixels on `overlay.py` and a factor on `proxy.py`).
   tighter ceiling states its range.
 - **A value equal to the default is not checked**, so a default outside its own stated range would
   hide; the test reads every stated range against its default instead.
-- Zero is not decided here. On most options it is a real setting; the ones where it is not keep
-  their own check.
-- Code: `scripts/_common/runner.py` (`apply_common`). Test:
-  `test_a_number_outside_what_its_option_takes_is_refused_on_every_tool` (tests/test_contract.py).
+- **Zero is decided by the help too (#749).** On most options 0 is a real setting and is taken. An
+  option where it is not states `> 0` (`export --duration`, `--pad-blur`, `--emoji-scale`), read as
+  above 0 and at most a million, or a range from 1 (`caption --font-size 1..2000`). fit.py's own
+  `--pad-blur` check went with it, so one option is not refused in one tool and read as another
+  value in the next.
+- Code: `scripts/_common/runner.py` (`apply_common`). Tests:
+  `test_a_number_outside_what_its_option_takes_is_refused_on_every_tool` and
+  `test_a_zero_an_option_cannot_take_is_refused_before_a_dry_run_749` (tests/test_contract.py);
+  the class guard `NumericGuard` (tests/test_guards.py) gives every stated range's edges to every tool.
 
 ## After 4.2.1 — one file per `-o` (#562)
 
@@ -6608,11 +6727,16 @@ is pixels on `overlay.py` and a factor on `proxy.py`).
 ## After 4.2.2 — the answer is a command, and three options by request
 
 - **`try:` is printed only when it is known.** A usage error ends with the corrected command when
-  every mistake on the line has exactly one answer: one near option, one choice near the word given
-  (or a common other word for it: strong is high, light is low), a number written with its unit
-  (`-30dB`, `0.8s`, `1080px`). If any mistake has two candidates or none, no command is printed: a
-  caller that copies would run a guess as if it were the answer. The command is one the tool
-  takes, and the test runs each.
+  every mistake on the line has exactly one answer: one option spelt like the flag, one choice near
+  the word given (or a common other word for it when that word is a choice: strong is high, light is
+  low), a number written with its unit (`-30dB`, `0.8s`, `1080px`). If any mistake has two
+  candidates or none, no command is printed: a caller that copies would run a guess as if it were
+  the answer. A flag another tool takes, and an option that only shares a word with the flag or
+  whose help mentions it, are named in the hint and are not an answer: they mean something else
+  and take another value (`speedramp.py --ramp 3:6:0.5` is not `--segment 3:6:0.5`, which
+  speedramp refuses). The command corrects the mistakes it names and nothing else, so a value the
+  right option refuses is refused under its right name too; the test runs every rule on every tool
+  of `tests/sweep.py`'s table with a value the option takes, and each command it prints.
 - **A number after an option is joined with `=`.** argparse reads `--threshold -30dB` as two
   options. The corrected form is `--threshold=-30`.
 - **Three options were added during the freeze, by name.** `proxy --height`, `redact --rect` and
@@ -6624,7 +6748,8 @@ is pixels on `overlay.py` and a factor on `proxy.py`).
   would be a second code path through that. `cut.py` then `reverse.py` does it, and the usage
   error names `cut.py`.
 - Code: `scripts/_common/runner.py` (`_teach`), `scripts/proxy.py`, `scripts/redact.py`,
-  `scripts/metadata.py`. Tests: `StumbleLedgerTests` (tests/test_contract.py).
+  `scripts/metadata.py`. Tests: `StumbleLedgerTests` (tests/test_contract.py),
+  `test_a_try_line_is_a_command_the_tool_accepts` among them.
 
 ## After 4.3.0 — the AAC coder is named from FFmpeg 9.1 on (#659)
 
@@ -7037,3 +7162,206 @@ Four items were asked; two already existed when this was built, so only the othe
   `test_a_start_with_no_rise_near_it_is_not_measured_and_keeps_the_transcript_time`,
   `test_lead_and_tail_margins_and_the_shorthand`, `test_ranges_the_margins_make_overlap_meet_in_the_middle`,
   `test_a_dry_run_measures_and_writes_nothing`, `test_refusals`.
+
+## After 4.16.0 — materials for a review page: joins to listen to, and the crop window as data (#581)
+
+Of what the issue asked, `--dry-run`, `--plan`, `render.py --export-timeline`, `silence.py --list`/`--edl`/`cut_points`,
+`proxy.py` and `fit.py`'s `timing.speed_factor` existed when this was built. Two things were added, as flags and keys
+of tools that exist; no tool and no MCP tool. Not built: a low-resolution preview render of a whole project
+(`render.py --preview`), `cut.py --audition`, and `render.py --dry-run` gathering each clip's speed and crop.
+
+- **`silence.py --audition DIR` makes each clip with the join the cut uses.** The clip is `cut.join_from_source`
+  over two ranges, the last `--audition-seconds` of the range before the join and the first of the one after it,
+  with no fade, as the cut has none. So what is heard is the join as the cut makes it, not an excerpt of the
+  written cut that would need the cut first. Each side is at most its own range: a clip never reaches over a
+  second join. A range removed at the file's start or end joins nothing and gets no clip.
+- **Small and fast, never the delivery.** At most 360 lines and never enlarged, `ultrafast` at quality 30, in
+  the default codec whatever `--codec` says (an `.mp4` holds no ProRes), `.m4a` when the cut is sound only. The
+  two sides are floored to whole frames, so `join_at` is where the join falls in the clip.
+- **Under `--list` the clips are rendered and nothing else.** That is the point: the joins are heard before
+  anything is cut. With a real run the clips come before the cut, which they do not need, so the result's
+  `encoder` is still the cut's; an existing `-o` is refused before the first clip, as the cut would refuse it.
+  `--max-cuts` bounds the clips under `--list` too, because there they are rendered.
+- **Files.** `DIR` must exist (`output_dir_missing`: this tool never creates directories). Every clip and
+  `DIR/index.json` goes through the side-file guard (not an input, not another output, refused when it exists
+  without `--overwrite`) before the first write, a dry run included. A clip that fails removes the clips this run
+  wrote; the index is written last. The index is the result's `audition` with `source` in place of `index`; its
+  `duration` and `audio` are measured on each written clip.
+- **`fit.py --fit crop` states its window as `crop`**, from the numbers the crop filter is built from: in the
+  source's displayed pixels (a 1920x1080 source cropped to 9:16 is `x 656, width 608`) and in the scaled frame.
+  It is in dry-run JSON and plans because it is computed, not measured; `picture` after a real run is the
+  measurement, and the test holds the two to one rectangle. A dry run whose input is not there yet has none.
+- Code: `scripts/silence.py` (`audition_plan`, `write_auditions`), `scripts/cut.py` (`_join_chunk`'s `low`),
+  `scripts/fit.py`. Tests (tests/test_editing.py): `test_silence_audition_writes_a_clip_of_each_join_as_the_cut_sounds`,
+  `test_fit_crop_states_its_window_before_anything_runs`.
+
+## After 4.16.0 — house encoder settings (#576)
+
+Nothing of this existed before: `encoder` (the last video encoder's name) and `hw` were the only
+encode facts a result carried, and `FFMPEG_SKILL_HW` the only machine default.
+
+- **One variable, `FFMPEG_SKILL_ENCODE=codec=h264,quality=18,preset=medium,hw=0,locked`, read in
+  `apply_common()`**, so every tool takes it the same way and none reads it on its own. It sets the
+  default of the flags a tool already has: `--codec`, `--quality`, an x264 `--preset` (not
+  `export.py`'s delivery `--preset`, not `render.py`'s `--intermediate-preset`), and `--hw`/`--no-hw`
+  through `FFMPEG_SKILL_HW`, so it reaches exactly where that variable reaches. No key is a new
+  encoder option, and a tool without those flags never reads it (`probe.py` with a broken value runs).
+- **`export.py`'s delivery presets keep their own codec and CRF under a policy.** A preset is a
+  platform's spec, and the policy cannot make an `.mp4` for a platform that asks for another CRF honest;
+  the result's `encode` shows what ran and `encode.policy.applied` which keys the house set (none there).
+- **Unlocked, a flag the call gives wins; `locked` refuses it** when its value is not the house one,
+  `kind: input`, `error.reason: encode_policy`, before any ffmpeg command, dry runs included. The same
+  value spelled out is not refused. `--fast` is refused under `locked` only when a preset is pinned, its
+  one effect being to replace the preset; a policy that pins codec and quality alone leaves previews open.
+- **An entry that does not read is refused, never skipped**: a house setting read wrongly would let the
+  drift it exists to stop through without a word. `quality` is range-checked by `--quality`'s own check.
+- **`encode` is read off the command line of the last video encode** (`emit.encode_record`), as `encoder`
+  is, so it is what ran after a GPU fallback and what a dry run planned, not what the flags asked.
+  `crf`/`preset` are `null` for an encoder that takes none. `render.py` reports its last stage's; its own
+  `policy.applied` names only its own flags (each stage applies the variable itself). `batch.py`'s rows
+  carry their item's.
+- **`preview: true` on any `--fast` result, absent otherwise**, so an unchanged run's document is unchanged.
+- **The cache keys of `render.py` and `batch.py` include the variable only when it is set**, so a cache
+  written without it still hits, and a stage made under one house setting is never served under another.
+- Code: `runner._apply_encode_policy`, `emit.encode_record`, `emit.steps_encoder_report`,
+  `render.cache_key`, `batch.gpu_key`. Tests: `EncodePolicyTests` (tests/test_contract.py):
+  `test_unset_changes_nothing_and_every_encode_is_recorded`,
+  `test_the_house_settings_are_the_defaults_and_a_flag_still_wins_unlocked`,
+  `test_locked_refuses_another_choice_before_ffmpeg_runs_dry_runs_included`,
+  `test_an_entry_that_does_not_read_is_refused_where_the_policy_applies`,
+  `test_batch_rows_carry_their_encode_and_the_cache_key_its_policy`.
+
+## After 4.18.0 — crop.py folded into fit.py (#683)
+
+- **`fit.py --rect W:H:X:Y` is crop.py's job, and crop.py is an alias.** The exact box (no scaling,
+  in the displayed frame, width and height even and refused if odd, an odd X/Y taken as given with
+  `exact=1`) is one function, `fit.crop_rect`; `crop.py` keeps its file and its options, turns them
+  into that call, and writes the same file byte for byte (the dry-run command line is the same, the
+  output name aside). `--rect W:H` without X:Y is a centred box, x = (width - W) / 2 rounded down.
+- **The order is FFmpeg's `crop=W:H:X:Y`**, the order `cropdetect.py` prints (`detected crop=...`)
+  and now hands on as `fit.py IN --rect W:H:X:Y`. `redact.py --rect` keeps `X:Y:W:H` (4.3.0): one
+  option name with two orders is a trap, and it is answered by the box having to fit the frame (most
+  swapped values do not) rather than by renaming either: W:H:X:Y is the shape #676's probe table lists for crop.py,
+  and redact's X:Y:W:H is what a model wrote for redact (`docs/stumbles.jsonl`). A wrong-way box that fits is not caught.
+- **`--rect` takes no other reframe in the same run.** `--duration`, `--aspect`, `--fit` (other than
+  crop), `--width/--height`, `--crop-x/-y`, `--zoom`, fades, `--rotate/--flip` and `--audio-stream`
+  are refused with the box, naming the option to run as a second `fit.py` step. The box is cut from
+  the source's displayed frame, so a rotate before it would change which pixels X:Y names.
+- **`fit.py --width W --height H --fit crop` keeps its meaning: scale to cover, then a centred W x H
+  window.** #683 proposed it as the centred box, but on a source larger than the box on both axes it
+  scales down today (a 3840x2160 clip to `--width 1080 --height 1920 --fit crop` keeps the full
+  height), and the centred box would keep a 1080x1920 piece of the middle: the same command would
+  write another picture. Where the box already fills one axis (a 1920x1080 clip to 1080x1080) the two
+  are the same window. The unscaled centred box is `--rect W:H`.
+- **An alias is described, callable and not advertised** (`_contract.ALIASES`, `alias_of` on its
+  ToolSpec). It stays in `contract --json`, in `provides` (a cross-repository id is not withdrawn), in
+  `tools/call` and in the 1.x snapshot (`tests/fixtures/mcp_tools.json`, read from every contract tool,
+  not from `tools/list`), and leaves the tool count (41), README's Tools section and the "Why 41"
+  table, SKILL.md's request table and `tools/list`, default or `FFMPEG_SKILL_MCP_FULL=1`.
+  `crop.py --x/--y/--width/--height` are no longer required one by one: `--rect`, or a size with no
+  corner (`--center` says so) is the centred box (#676's crop items).
+- **The other candidates of #683, looked at one by one; none is folded:**
+  - `straighten.py` beside `fit.py --rotate`: **keep.** `--rotate` is an exact 90-degree turn
+    (transpose, the frame's sides swap, nothing is lost); straighten is the `rotate` filter by any
+    angle, with its own covering scale (`|cos| + max(W/H, H/W) |sin|`, A235) and its own
+    `--fit crop|pad` and `--fill-color`. Folded, `fit.py --fit crop` would mean two different crops
+    by which other option is present.
+  - `pad.py` beside `insert.py` / `background.py`: **keep.** pad.py adds time (black and silence)
+    to a clip; insert.py and background.py make a new clip from a still or a colour. No shared
+    option or code path.
+  - `proxy.py` beside `export.py --preset`: **keep, for now.** A proxy is preset-like, but
+    export.py's presets fix the frame and the encoder, normalise loudness and fail a delivery that
+    misses a property, while a proxy's width or scale is the caller's, is never upscaled, keeps the
+    source's dynamic range and is not a delivery. A `proxy` preset would need `--width/--scale`
+    and an exemption from export's verification: more code and a second meaning of a preset, not
+    one job under two names. `capability_map`'s `media.proxy` resolves to proxy.py.
+  - `cropdetect.py`, `scenes.py`, `probe.py`, `look.py`: analysis; each measures something the
+    others do not. Left as they are.
+- Code: `fit.crop_rect()`, `fit.main()`, `crop.main()`, `_contract.ALIASES`, `tool_spec()`
+  (`alias_of`), `mcp/server.py tool_list()`. Tests:
+  `test_fit_rect_writes_crops_file_and_a_box_without_a_corner_is_centred` (tests/test_editing.py),
+  `test_docs_tool_count_matches_the_real_tool_list`, `test_mcp_tools_match_contract`,
+  `test_mcp_tool_surface_matches_the_frozen_1x_snapshot` (tests/test_contract.py).
+
+## After 4.19.0 — the change floor surveyed across encoders, and a finer grid: `--change-grid` (#442)
+
+- **The survey.** `tests/change_floor_survey.py` (stdlib, about 15 minutes; not a test) turns each
+  source into a 1.5 s, 24 fps lossless 4:2:0 mezzanine and encodes it twice per setting: untouched,
+  and with four edits at their own frames (a caption cue, a 60x60 logo, a 24x24 logo, a colour
+  tweak of the whole frame, sizes in 1080p pixels). It measures with `change_tiles()`'s own graph
+  on three grids: **spill**, the largest tile no edit covers (edited against untouched, same
+  settings: the comparison the docs ask for); **untouched**, the largest tile of the untouched
+  encode against the mezzanine (what a re-encode alone gives); and each edit's smallest score, the
+  least of its frames' largest tile inside it. Sources: every clip in `demos/footage` (the twelve
+  1080p ones and the two small ones at their own size) and five synthetic pictures (testsrc2,
+  noise, gradients, dark low-light, a fast pan); all thirteen settings on the seven hardest at
+  1080p, four common ones on the rest, the seven `--quick` ones at 720p and 480p on four of them.
+  201 encodes, FFmpeg 6.1.1. Largest values on tiles of 20 px and more (spill / untouched):
+
+  | encode (pairs) | 32x18 (60 px at 1080p) | 64x36 (30 px) | 96x54 (20 px) |
+  |---|---|---|---|
+  | libx264 crf 18 medium (7) | 6 / 5 | 7 / 6 | 8 / 8 |
+  | libx264 crf 23 medium (27) | 12 / 11 | 13 / 12 | 14 / 12 |
+  | libx264 crf 23 veryfast (7) | 12 / 11 | 13 / 13 | 16 / 16 |
+  | libx264 crf 28 medium (27) | 18 / 21 | 22 / 22 | 22 / 22 |
+  | libx264 crf 35 medium (7) | 19 / 26 | 24 / 27 | 32 / 37 |
+  | libx265 crf 28 fast (27) | 16 / 20 | 18 / 21 | 18 / 21 |
+  | libx265 crf 34 fast (7) | 18 / 22 | 20 / 25 | 31 / 37 |
+  | libsvtav1 crf 35 preset 10 (7) | 17 / 18 | 18 / 19 | 21 / 21 |
+  | libsvtav1 crf 50 preset 10 (27) | 29 / 31 | 32 / 46 | 36 / 43 |
+  | libaom-av1 crf 35 cpu-used 8 realtime (17) | 17 / 16 | 20 / 27 | 42 / 42 |
+  | libvpx-vp9 crf 33 cpu-used 8 realtime (17) | 12 / 14 | 14 / 15 | 14 / 15 |
+  | prores (prores_aw) proxy (17) | 2 / 17 | 2 / 18 | 3 / 19 |
+  | prores standard (7) | 1 / 3 | 2 / 3 | 2 / 3 |
+  | smallest caption cue | 33 | 72 | 103 |
+  | smallest 60x60 logo | 67 | 103 | 117 |
+  | smallest 24x24 logo | 6 | 24 | 54 |
+  | smallest colour tweak | 6 | 6 | 7 |
+
+  The footage stays lower (its largest spill was 21, veo_rain at libsvtav1 crf 50, and 15 at
+  libx264 crf 28); the largest values are testsrc2's sharp detail and the noise picture. A finer tile averages fewer pixels, so the encoder's error rises
+  with it: at 64x36 testsrc2 at 480p (13 px tiles) reached 49 to 66 with libsvtav1 crf 50 and
+  libaom-av1, at 96x54 (9 px) 99 and 105.
+- **24 stays the floor of the 32x18 grid.** It is above every surveyed setting's spill except
+  libsvtav1 crf 50 below 720p (29 at 480p, 24 at 720p, on testsrc2), a quality nobody delivers at,
+  and under the smallest real edit (33, a caption at 480p, ProRes proxy). The untouched side
+  passes it only at the lowest qualities (libx264 crf 35, libsvtav1 crf 50): comparing a render
+  with its source instead of with a render of the same settings is what the docs already warn
+  about. Not per encoder: the floor would then depend on settings check.py cannot read (CRF,
+  preset), and the common ones of every encoder fit under one number.
+- **`--change-grid 32|64|96`, each with its own floor: 24, 32, 48.** The floor for 64 is above
+  every surveyed spill on 20 px tiles and more (32 at most, libsvtav1 crf 50; 22 for the common
+  settings), the one for 96 above libaom-av1 realtime's 42, the largest at that grid. The real
+  edits stay above both: a caption at 72 and 103, a 60x60 logo at 103 and 117. A 24x24 logo
+  scored 6 to 19 on the default grid (missed), 24 to 73 at 64 (found when it does not straddle
+  four tiles) and 54 or more at 96 (20 px tiles, which are now refused, below): a change that
+  small needs 64 at 1080p, where it is found when it falls inside one tile, or 96 on a 2880 px picture. `--change-floor` still
+  replaces the grid's floor. The grid is in the row ("floor 32 on 64x36 tiles") and in
+  `change_scope.tile`. Code: `probe.CHANGE_FLOORS`, `check.change_scope_row()`. Tests:
+  `test_check_change_grid_finds_a_logo_smaller_than_a_tile_442`,
+  `test_check_change_floor_holds_for_every_available_encoder_442` (each surveyed encoder this build
+  has, at a common setting, testsrc2 with a 60x60 logo: 720p at 32, 1080p at 64, 2880x1620 at 96,
+  no undeclared change; an encoder the build lacks is skipped).
+- **A finer grid is refused where its tiles are under 30 px** (64 needs 1920x1080, 96 needs
+  2880x1620; the narrower tile side counts, so a 1080x1920 picture, 17 px across at 64, has
+  neither). Under 20 px a re-encode alone passed the floors (above). The survey allowed 20 px
+  (64 at 720p, 96 at 1080p), and CI on macOS (FFmpeg 9.0.2, a libsvtav1 newer than the survey's
+  1.7.0) found what that costs: libsvtav1 crf 35 preset 10, testsrc2 at 720p on 64x36 tiles, the
+  untouched and the logo encode differed by 143 on one 20 px tile at (100, 80) for 2 frames, far
+  from the logo (quiet peak 31); 1.7.0 gives 15 there. 143 is above every real edit's score, so no
+  floor separates it: an encoder that moves bits to fine moving detail when an edit takes some
+  changes a tile that small for real. On 30 px tiles and more the same encoder passed. The owner's
+  decision (2026-11-27): the finer grids need 30 px tiles, and lose 1080p at 96, rather than keep a
+  grid that can call an untouched tile changed. The 32x18 default keeps its behaviour on every size. Three choices and not any
+  number: each is a floor that was measured.
+- **The grid and the floor need `--expect-changed`.** Without it neither is used, so either is
+  refused, as is a grid outside the three.
+- **Not measured: hardware encoders** (NVENC, Quick Sync, VAAPI, VideoToolbox, AMF; this machine
+  has none), libaom-av1 and libvpx-vp9 at their slower "good" settings, 10-bit and HDR pictures.
+  A clip that passes the floor untouched is a reason for `--change-floor`, and its numbers a
+  reason to add a row here. The colour tweak (brightness +0.03, saturation 1.15) is not found on
+  any grid, as the limit of the tiles says: `similarity` is the row for a faint change over the
+  whole picture.
+- **A 96x54 frame costs more.** Each frame is 15,552 bytes instead of 1,728 and a changed frame's
+  mask holds up to 5,184 bits: an hour at 30 fps in which every frame changed is about 70 MB of
+  masks (10 MB at 32x18).

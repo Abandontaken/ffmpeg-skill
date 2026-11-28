@@ -102,8 +102,8 @@ platforms change it and whoever uploads checks the current one. `check.py` WARNs
 - verdict thresholds — what passes, and where each number lives
 - probe.py — inspect
 - cut.py — cut / join segments
-- fit.py — target duration and/or aspect, rotate/flip
-- crop.py — crop to an exact pixel rectangle
+- fit.py — target duration and/or aspect, an exact box, rotate/flip
+- crop.py — alias of `fit.py --rect`
 - insert.py — still image to a timed silent clip, with Ken Burns zoom/pan
 - broll.py — cut away to a B-roll clip for a window and come back
 - metadata.py — chapter markers and title/artist/comment tags, streams copied
@@ -346,11 +346,12 @@ rather than treated as if every grid point were supported, as is one whose
 `render.py` forwards a project's `"snap": {"to": "beats", ...}` (project-wide
 or per clip) to this flag and reports what came back.
 
-### fit.py — target duration and/or aspect, rotate/flip
+### fit.py — target duration and/or aspect, an exact box, rotate/flip
 ```
 fit.py INPUT [--duration T --method speed|trim [--from-center] [--max-speed 4]]
              [--aspect 16:9|9:16|1:1|4:5|W:H --fit pad|crop|blur [--width W] [--height H] [--pad-color black] [--pad-fill color|blur [--pad-blur 20]]]
              [--rotate 90|180|270] [--flip h|v] [--fps N] [-o OUT]
+fit.py INPUT --rect W:H[:X:Y] [--fps N] [-o OUT]
              [--zoom in|out [--zoom-amount 1.3] [--zoom-start S] [--zoom-duration S] [--crop-x X] [--crop-y Y]]
 ```
 `speed` retimes video and audio together (pitch-preserving `atempo`). For
@@ -392,7 +393,9 @@ below its measurement threshold. A `crop_content_off_centre` warning may suggest
 The warning can flag an individual sample even when most motion stayed in frame.
 Use `look.py OUTPUT --at TIME` for each `crop_check.review_points[].output_time_estimate`
 that is available. To compare a trimmed or retimed output with its input, extract the
-source frame separately using the point's `source_time`.
+source frame separately using the point's `source_time`. The window itself is data before anything
+runs: `crop` (dry run, plan and result) gives `{x, y, width, height}` in source pixels and the
+scaled frame's offset (#581).
 `--duration` on a still picture is refused (it has no length: `insert.py` makes a clip of it).
 `--zoom in|out` (#647) is a timed push-in or pull-out of the delivered frame (after the
 reframe, before the fades): linear from 1 to `--zoom-amount` (in; out goes back), between
@@ -406,10 +409,15 @@ or past the output's end, a move past it, and
 the move, and `zoom.check` compares the output's frame count, timestamps, duration and rate with
 the source's packets; it is `measured: false` when the run also trims, retimes or regrids.
 
-### crop.py — crop to an exact pixel rectangle
+### crop.py — alias of `fit.py --rect`
 ```
-crop.py INPUT --x X --y Y --width W --height H [-o OUT]
+crop.py INPUT --width W --height H [--x X --y Y | --center] [-o OUT]
+crop.py INPUT --rect W:H[:X:Y] [-o OUT]
 ```
+Since 4.19 (#683) an alias: it runs the code `fit.py --rect W:H:X:Y` runs and writes the same
+file, and is left out of the tool count and `tools/list` (`alias_of: fit` in the contract).
+Without `--x/--y` (or with `--center`, or `--rect W:H`) the box is centred: x = (source width -
+W) / 2, rounded down. `fit.py --rect` takes no other reframe option in the same run.
 Crops to a literal `{x, y, width, height}` rectangle in source pixels —
 distinct from `fit.py --fit crop`, which crops to an *aspect ratio* and picks
 the rectangle for you. Use this when the rectangle is already known (a
@@ -429,7 +437,7 @@ cropdetect.py INPUT [--seconds N] [--samples N] [--limit F] [--round N] [--motio
 Measurement only -- writes no file. Samples `--samples` windows spread
 across the file (default 5, totalling `--seconds` 10s of footage) and
 reports the crop rectangle FFmpeg's `cropdetect` filter found most often, as
-`{x, y, width, height}` ready to hand to `crop.py`. `source_width` /
+`{x, y, width, height}` ready to hand to `fit.py --rect W:H:X:Y`. `source_width` /
 `source_height` are that same displayed frame: a 90° or 270° rotation swaps
 the stored size, because the filter measures the picture after ffmpeg applies
 the tag. Distinct from
@@ -833,7 +841,7 @@ Preview with `silence.py INPUT --profile editor.json --dry-run`, then supply `-o
 and verify. [Presets, protected ranges and saved plans](../docs/contract.md#pacing-profiles-and-the-independent-master-gate).
 ```
 silence.py INPUT [--threshold -35] [--min-silence 0.6] [--margin 0.2] [--margin-lead S] [--margin-tail S] [--min-keep 0.2] [--list]
-           [--sentence-min-silence S] [--sentence-margin-tail S]  (with --words FILE or --transcribe) [--edl keep.txt] [--timemap map.json|map.csv] [--speech-aware] [-o OUT]
+           [--sentence-min-silence S] [--sentence-margin-tail S]  (with --words FILE or --transcribe) [--edl keep.txt] [--timemap map.json|map.csv] [--audition DIR [--audition-seconds 2]] [--speech-aware] [-o OUT]
 silence.py INPUT --filler --words transcript.json [--filler-lang auto|en|ja|ko|zh|es|de|fr|pt|it|nl|pl|ru|tr]
            [--filler-words FILE] [--filler-extra W,W] [--filler-keep W,W] [--filler-pad 0.02]
            [--transcribe] [--engine auto|parakeet-mlx|parakeet.cpp|whisper.cpp|faster-whisper|openai-whisper]
@@ -895,6 +903,17 @@ are computed, not measured on the written file. An existing map is refused witho
 and a missing directory or a directory at the path as `kind: input`, before anything runs (a dry
 run predicts both); the map is written only after the cut is, so a failed or refused encode
 leaves none. A dry run writes nothing.
+
+**`--audition DIR` (#581)** writes, per join between two kept ranges, a short clip of the cut as
+it sounds there: `--audition-seconds` (2, 0.5..10) of the range before the join and of the one
+after it, each side at most its own range, joined the way the cut is (no fade, the default codec), at most 360
+lines high (never enlarged), a fast small encode, `DIR/cut_000.mp4` (`.m4a` for a sound-only
+cut), and `DIR/index.json` listing them: `cut_index`, `source_out`, `source_in`, `output_t`,
+`clip`, `clip_source`, `join_at` (seconds into the clip) and the measured `duration` and `audio`.
+The result's `audition` is the same document. `DIR` must exist; an existing clip or index is
+refused without `--overwrite`. The clips come before the cut; under `--list` they are all that is rendered, so the joins
+are heard before anything is cut; a range removed at the file's start or end joins nothing and
+has no clip. A dry run plans the commands and writes nothing.
 
 **`--filler` (1.17)** removes filler words as well, through the same
 `keep_ranges()` graph with more, shorter ranges. It is **never**
@@ -1065,11 +1084,33 @@ render.py project.json --cache DIR [--from STAGE]    # reuse identical stages fr
 render.py plan.json [--audit-log FILE]       # execute a plan written by <tool> --plan plan.json
 render.py project.json --export-timeline edit.fcpxml|edit.edl|edit.otio   # the cut for an editor, nothing rendered
 render.py project.json --intermediate-preset medium   # the stages' own encoder preset instead of superfast
+render.py v2.json --compare-project v1.json   # check the render changed only what the project edit changed
 ```
 A real render first runs its own dry run; when that is refused because a stage needs a filter or an
 encoder this build lacks (`filter_missing`, `encoder_missing`), the real run is refused with the dry
 run's document before the first stage encodes, not after the stages before it (`waveform.py` with a
 title or captions does the same).
+`--compare-project OLD.json` (#442 phase 4) takes the expected change from the edit instruction,
+not from what the agent says it did: the difference between OLD.json and this project becomes
+`check.py --compare OLD's-output` with `--expect-changed`, `--expect-audio-changed` and
+`--expect-removed`, run after the last stage. Keep the previous project and its render (copy
+`project.json` to `v1.json` before editing, and give the new one another `output`). What maps: a
+caption cue whose text or times changed is its own span (every cue when a style key changed or
+the cues are an ASS file); an overlay or graphic entry added, removed or changed is its old and new
+window (no end: to the end); `brand`/`template` are the whole picture, `audio`/`loudness` the whole
+sound, `export` both; a later `in` on the first clip and an earlier `out` on the last are removed
+spans in the previous render's time, and the cues and layers that moved with the head keep their
+content (a video layer, a graphic running to the end, a fading whole-clip overlay and, under an
+audio block, a loudness stage or a normalising export, the sound do not). Anything else on the
+timeline (a clip added, removed or re-timed otherwise, `transition`, `silence`, `fit`, `frame`,
+`audiogram`, `snap`) is refused before the first stage, `--dry-run` included
+(`project_diff_not_derivable`, each reason in `details.not_derivable`), since the check would rest
+on a guess. The result's `compare_project` holds the derived values, the `differences` they came
+from, check.py's document and `ok`: its `change_scope` and `audio_change_scope` rows; `ok: false`
+fails the render (`kind: verification`, the file kept). Spans are the window as written, ends
+included (an overlay `"end": 2` draws on the frame at 2.000 s, so a 2 s head trim leaves that frame
+changed); the floors and limits are check.py's (below). Not with `--stop-after`,
+`--export-timeline`, `--write-project`, a pack or a plan.
 The optional `stage_pictures` object keeps the fit and export stages' frame geometry under
 their stage names. Each report measures its own stage's frame and counts cropped pixels
 from that stage's input. `picture` carries the last sizing stage's report when available.
@@ -1453,7 +1494,7 @@ measurements that combine with each other and with `--beats`/`--highlights`:
 
 ### check.py — pre-delivery compliance
 ```
-check.py INPUT --platform youtube|shorts|reels|tiktok|x|linkedin|facebook|broadcast|podcast|custom [--no-loudness] [--content] [--compare REF [--expect-changed SPAN[@X,Y,W,H]|none]... [--expect-audio-changed SPAN|none]... [--expect-removed SPAN]... [--change-floor N]] [--levels bt709|ebu-r103 [--levels-window S] [--levels-tolerance PCT]] [--expect-identity SIZE:MTIME_NS] [--json]
+check.py INPUT --platform youtube|shorts|reels|tiktok|x|linkedin|facebook|broadcast|podcast|custom [--no-loudness] [--content] [--compare REF [--expect-changed SPAN[@X,Y,W,H]|none]... [--expect-audio-changed SPAN|none]... [--expect-removed SPAN]... [--change-grid 32|64|96] [--change-floor N]] [--levels bt709|ebu-r103 [--levels-window S] [--levels-tolerance PCT]] [--expect-identity SIZE:MTIME_NS] [--json]
          [--max-duration S] [--aspect 9:16] [--lufs -14] [--tp -1] [--max-mb N]
 ```
 PASS/WARN/FAIL per check with the script that fixes it. Run it as the final
@@ -1501,11 +1542,15 @@ encoded alike (codec, pixel format or frame rate) are a WARN and a note. **When 
 compared (another frame size, another frame count, an unreadable frame count or a failed pass) the
 row is FAIL**, since "not measured" must not read as "nothing else changed". The measure: both
 pictures as 8-bit RGB, subtracted, each frame area-scaled to 32x18 tiles; a tile changed when its
-largest channel is above the floor (`--change-floor`, default 24 of 255). The JSON
+largest channel is above the floor (`--change-floor`, default 24 of 255). `--change-grid 64` or
+`96` (#442) cuts the frame finer, 30 or 20 px tiles at 1080p, with floors of 32 and 48 measured
+across libx264, libx265, libsvtav1, libaom-av1, libvpx-vp9 and ProRes; it is refused where a tile
+would be under 20 px (64 needs 1280x720, 96 needs 1920x1080). A 24x24 logo at 1080p is under the
+default floor and found at 96. The JSON
 `change_scope` document has `declared`, `observed`, `undeclared`, `declared_unchanged`, `floor`,
-`tile`, `frames` and `quiet_peak` (the largest tile that stayed under the floor: how close the
+`tile` (the grid used), `frames` and `quiet_peak` (the largest tile that stayed under the floor: how close the
 unchanged part came). Limits: a change much smaller than a tile is diluted (a full-contrast
-change needs about a tenth of a tile, 19x19 px at 1080p); a faint shift over the whole picture
+change needs about a tenth of a tile, 19x19 px at 1080p on the default grid); a faint shift over the whole picture
 stays under the floor in every tile, and `similarity` is the row for that; it compares the
 picture only; an edit that changes the length cannot be paired and FAILs as not compared, unless
 `--expect-removed` declares what it cut (below). Compare

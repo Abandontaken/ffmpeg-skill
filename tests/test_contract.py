@@ -34,13 +34,14 @@ sys.path.insert(0, str(ROOT / "mcp"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _contract  # noqa: E402
 from _common.runner import HW_ENV, HW_FORCED_ENV  # noqa: E402
+ENCODE_ENV = "FFMPEG_SKILL_ENCODE"  # EncodePolicyTests pins it to the runner's name
 from _fixtures import OUT, SHARED_OUT  # noqa: E402
 
 # The host's own GPU default must not reach the suite (every tool subprocess inherits os.environ):
 # a machine with FFMPEG_SKILL_HW=1 would put every encode on VideoToolbox. Tests that exercise it
 # opt in with an explicit env. The names come from the runner, so this scrub and the one in
 # tests/_fixtures.py cannot drift from what the tools read.
-for _k in (HW_ENV, HW_FORCED_ENV):
+for _k in (HW_ENV, HW_FORCED_ENV, ENCODE_ENV):  # and the house encoder settings (#576)
     os.environ.pop(_k, None)
 
 for _k in ("FFMPEG_SKILL_MCP_FULL", "FFMPEG_SKILL_MCP_TOOLS"):
@@ -221,7 +222,9 @@ class ContractTests(unittest.TestCase):
         one so a new/removed tool that forgets to update one of them fails CI instead of
         drifting silently -- see #50, filed after README said 28 twice, 22 once (stale), and
         package.json's description said 21, all at the same time."""
-        real_count = len(self.contract["tools"])
+        # an alias (#683: crop, folded into fit) is described but not counted
+        real_count = len([t for t in self.contract["tools"] if "alias_of" not in t])
+        self.assertEqual(real_count, 41)
         checks = [
             (ROOT / "README.md", re.compile(r"\b(\d+)\s+(?:public )?(?:tools|names)\b|\ball (?P<n>\d+) by\b")),
             (ROOT / "docs" / "contract.md", re.compile(r"\b(\d+)\s+tools\b")),
@@ -272,7 +275,7 @@ class ContractTests(unittest.TestCase):
             seen_core |= core
             seen_all += names
         self.assertEqual(seen_core, set(_contract.MCP_CORE_TOOLS))
-        self.assertEqual(sorted(seen_all), sorted(t["name"] for t in self.contract["tools"]))
+        self.assertEqual(sorted(seen_all), sorted(t["name"] for t in self.contract["tools"] if "alias_of" not in t))
         self.assertEqual(set(groups), {r.strip("|").split("|")[0].strip() for r in rows[:-1]})
         total_name, total_counts, _ = [c.strip() for c in rows[-1].strip("|").split("|")]
         self.assertEqual(total_name, "**Total**")
@@ -1116,12 +1119,12 @@ class ContractTests(unittest.TestCase):
     def test_examples_are_parsed_from_skill_md_and_cover_every_tool(self):
         """1.20.0: contract --json's per-tool `examples` field is SKILL.md's own request table
         (the "User says" / "Do" rows), machine-readable -- not a hand-maintained second copy.
-        Every one of the 42 tools is named in that table somewhere, so every tool has at least
-        one example; a row's markdown backticks are stripped from `command`, and a row with
+        Every tool but an alias (#683: crop, out of the table) is named in that table somewhere, so
+        it has at least one example; a row's markdown backticks are stripped from `command`, and a row with
         several quoted phrasings ("cut from 1:20 to 2:05", "trim the first 10 s") becomes a
         `prompts` list rather than one string."""
         by_name = {t["name"]: t for t in self.contract["tools"]}
-        missing = [name for name, t in by_name.items() if not t.get("examples")]
+        missing = [name for name, t in by_name.items() if not t.get("examples") and "alias_of" not in t]
         self.assertEqual(missing, [], "every tool should have at least one SKILL.md example")
         cut = next(e for e in by_name["cut"]["examples"] if "cut from 1:20 to 2:05" in e["prompts"])
         self.assertEqual(cut, {"prompts": ["cut from 1:20 to 2:05", "trim the first 10 s"],
@@ -2395,14 +2398,15 @@ sys.exit(fit.main())
     # ------------------------------------------------------------------ consistency: MCP and installer
     def test_mcp_tools_match_contract(self):
         """FFMPEG_SKILL_MCP_FULL=1 is the escape hatch back to the pre-1.18.3 behaviour: every
-        contract tool listed. This test proves that view is still byte-for-byte the full set."""
+        contract tool listed but an alias (#683). This test proves that view is still the full set."""
+        advertised = [n for n, s in self.tools.items() if "alias_of" not in s]
         saved = os.environ.get("FFMPEG_SKILL_MCP_FULL")
         os.environ["FFMPEG_SKILL_MCP_FULL"] = "1"
         try:
             mcp_names = [t["name"] for t in mcp_server.tool_list()]
-            self.assertEqual(sorted(mcp_names), sorted(self.tools), "MCP tools/list (full) == contract tools")
+            self.assertEqual(sorted(mcp_names), sorted(advertised), "MCP tools/list (full) == contract tools but the aliases")
             listed = [l.split()[0] for l in sh(sys.executable, ROOT / "mcp" / "server.py", "--list", env={**os.environ}).stdout.splitlines() if l.strip()]
-            self.assertEqual(sorted(listed), sorted(self.tools))
+            self.assertEqual(sorted(listed), sorted(advertised))
         finally:
             os.environ.pop("FFMPEG_SKILL_MCP_FULL", None)
             if saved is not None:
@@ -2412,7 +2416,11 @@ sys.exit(fit.main())
             self.assertEqual(spec["mcp"]["positional"], mcp_server.POSITIONAL.get(name, ["input"]) if spec["mcp"]["positional"] else spec["mcp"]["positional"])
         # a real JSON-RPC round trip, full surface
         resp = self._rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}], full=True)[0]
-        self.assertEqual(sorted(t["name"] for t in resp["result"]["tools"]), sorted(self.tools))
+        self.assertEqual(sorted(t["name"] for t in resp["result"]["tools"]), sorted(advertised))
+        # an alias is not listed and is still called by name (#683)
+        self.assertEqual({n: s["alias_of"] for n, s in self.tools.items() if "alias_of" in s}, _contract.ALIASES)
+        self.assertEqual(_contract.ALIASES, {"crop": "fit"})
+        self.assertIn("usage:", mcp_server.call_tool("crop", {"argv": ["--help"]})["content"][0]["text"].lower())
 
     def test_mcp_tools_list_defaults_to_the_core_12(self):
         """roadmap P1-7 (docs/design-decisions.md): tools/list defaults to _contract.MCP_CORE_TOOLS,
@@ -2444,7 +2452,7 @@ sys.exit(fit.main())
             listed = sh(sys.executable, ROOT / "mcp" / "server.py", "--list").stdout
             self.assertEqual([line.split()[0] for line in listed.splitlines()], expected)
             full = self._rpc([request], full=True)[0]
-            self.assertEqual([t["name"] for t in full["result"]["tools"]], list(self.tools))
+            self.assertEqual([t["name"] for t in full["result"]["tools"]], [n for n, s in self.tools.items() if "alias_of" not in s])
 
     def test_mcp_reports_unknown_advertised_tool_names(self):
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
@@ -2461,9 +2469,9 @@ sys.exit(fit.main())
         # 2026-11-22 (#420, the owner's request): +500 each for audio.py's three --track options (about 505 bytes
         # in the listing; the full profile had 50 bytes of room, the default 250)
         profiles = (
-            ({}, 12, 75_000),  # +150 for check.py --expect-audio-changed (#442), +650 for cut.py --words and its five options (#449), +200 for check.py --expect-removed (#442, 162 bytes), +500 for fit.py --zoom and its three options (#647, 74913 measured)
-            ({"FFMPEG_SKILL_MCP_FULL": "1"}, 42, 196_600),  # +500 more for color.py --source-alpha-mode (#453), +200 for check.py --expect-removed (#442), +400 for fit.py --zoom (#647, 196549 measured)
-            ({"FFMPEG_SKILL_MCP_TOOLS": "probe,cut,fit,export,check"}, 5, 26_300),  # +600 for the same and check.py --expect-audio-changed (#442, #449), +200 for --expect-removed (#442), +500 for fit.py --zoom (#647, 26194 measured)
+            ({}, 12, 76_000),  # +150 for check.py --expect-audio-changed (#442), +650 for cut.py --words and its five options (#449), +200 for check.py --expect-removed (#442, 162 bytes), +500 for fit.py --zoom and its three options (#647, 74913 measured), +300 for silence.py --audition and --audition-seconds (#581, 75214 measured), +300 for render.py --compare-project (#442 phase 4), +200 for fit.py --rect (#683, 75745 measured), +200 for check.py --change-grid (#442, 75926 measured)
+            ({"FFMPEG_SKILL_MCP_FULL": "1"}, 41, 194_500),  # +500 more for color.py --source-alpha-mode (#453), +200 for check.py --expect-removed (#442), +400 for fit.py --zoom (#647, 196549 measured), +300 for silence.py --audition (#581, 196850 measured), +300 for render.py --compare-project (#442 phase 4); 41 tools, crop an alias not listed (#683, 194151 measured), +100 for main at 4.20.2 (194215 measured), +100 for check.py --change-grid (#442, 194412 measured)
+            ({"FFMPEG_SKILL_MCP_TOOLS": "probe,cut,fit,export,check"}, 5, 26_700),  # +600 for the same and check.py --expect-audio-changed (#442, #449), +200 for --expect-removed (#442), +500 for fit.py --zoom (#647, 26194 measured), +200 for fit.py --rect (#683, 26404 measured), +100 for check.py --change-grid (#442, 26616 measured)
         )
         for env, count, limit in profiles:
             with self.subTest(env=env), unittest.mock.patch.dict(os.environ, env):
@@ -2538,17 +2546,11 @@ sys.exit(fit.main())
         all 42 tools, so this reads tool_list() under FFMPEG_SKILL_MCP_FULL=1 -- the default's
         core-12 filter is a separate, tested concern (test_mcp_tools_list_defaults_to_the_core_12)."""
         snapshot_path = ROOT / "tests" / "fixtures" / "mcp_tools.json"
-        saved = os.environ.get("FFMPEG_SKILL_MCP_FULL")
-        os.environ["FFMPEG_SKILL_MCP_FULL"] = "1"
-        try:
-            live = [{"name": t["name"],
-                     "properties": sorted(t["inputSchema"].get("properties", {}).keys()),
-                     "required": sorted(t["inputSchema"].get("required", []))}
-                    for t in mcp_server.tool_list()]
-        finally:
-            os.environ.pop("FFMPEG_SKILL_MCP_FULL", None)
-            if saved is not None:
-                os.environ["FFMPEG_SKILL_MCP_FULL"] = saved
+        # every tool callable by name, an alias too (#683: crop is not listed and keeps its arguments)
+        live = [{"name": t["name"],
+                 "properties": sorted(t["inputSchema"].get("properties", {}).keys()),
+                 "required": sorted(t["inputSchema"].get("required", []))}
+                for t in map(_contract.mcp_tool, mcp_server.specs().values())]
         if os.environ.get("UPDATE_MCP_SNAPSHOT"):
             snapshot_path.write_text(json.dumps(live, indent=1) + "\n", encoding="utf-8")
         frozen = json.loads(snapshot_path.read_text(encoding="utf-8"))
@@ -2600,8 +2602,18 @@ sys.exit(fit.main())
                     self.assertEqual(sorted(entry), ["removed_in", "replacement", "since", "what", "where"])
                     self.assertIn(entry["where"], ("cli", "json", "mcp", "behaviour"))
                     self.assertTrue(entry["replacement"])
+        version = tuple(int(x) for x in json.loads((ROOT / "package.json").read_text())["version"].split("."))
+        beta = {t["name"] for t in self.contract["tools"] if t["stability"] == "beta"}
         for entry in self.contract["deprecated"]:
-            self.assertGreater(int(entry["removed_in"].split(".")[0]), pkg_major)
+            removed_in, since = (tuple(int(x) for x in entry[k].split(".")) for k in ("removed_in", "since"))
+            if entry["where"] == "cli" and entry["what"].split(".py ")[0] in beta:
+                # 4.x's beta rule: a beta tool's argument goes in a minor once one whole minor has listed it,
+                # so one listed from a patch (since 4.20.2) waits out 4.21 and goes in 4.22
+                self.assertEqual((removed_in[0], removed_in[2], removed_in[0] == since[0]), (since[0], 0, True), entry["what"])
+                self.assertEqual(removed_in[1], since[1] + (2 if since[2] else 1), entry["what"])
+                self.assertGreater(removed_in, version, entry["what"])
+            else:
+                self.assertGreater(removed_in[0], pkg_major)
         removed = self.contract["removed"]
         self.assertTrue(removed)
         for entry in removed:
@@ -2635,7 +2647,7 @@ sys.exit(fit.main())
     # are what that major's own PR is checked against.
     # None: not released yet. Set it to the tag date when that version ships; a major bump fails
     # while it is None, because the 90-day window cannot be counted from an unknown date.
-    DEPRECATION_RELEASE_DATES = {"1.10.0": "2026-09-13", "2.10.9": "2026-10-22", "2.14.0": "2026-10-24"}
+    DEPRECATION_RELEASE_DATES = {"1.10.0": "2026-09-13", "2.10.9": "2026-10-22", "2.14.0": "2026-10-24", "4.20.2": None}
     # A major released before step 2's 90 days had passed, by the maintainer's decision. Each one
     # must be stated in docs/contract.md (the needle below), so it is a written waiver, not a slip.
     WINDOW_WAIVERS = {2: "**2.0.0 waived the 90-day half of step 2.**", 3: "**3.0.0 waived the 90-day half of step 2.**"}
@@ -2654,7 +2666,9 @@ sys.exit(fit.main())
             with self.subTest(what=entry["what"]):
                 self.assertIn(entry["since"], self.DEPRECATION_RELEASE_DATES,
                               f"add {entry['since']}'s release date to DEPRECATION_RELEASE_DATES")
-                self.assertGreater(int(entry["removed_in"].split(".")[0]), major,
+                # a beta tool's argument (4.x's beta rule) goes in a minor: the same check, at the minor
+                at = 2 if entry["since"].split(".")[0] == entry["removed_in"].split(".")[0] else 1
+                self.assertGreater(tuple(int(x) for x in entry["removed_in"].split(".")[:at]), tuple(int(x) for x in pkg["version"].split(".")[:at]),
                                    f"package.json is {pkg['version']} but {entry['what']!r} is still "
                                    f"deprecated, not removed: remove it, then drop the entry")
         for entry in _contract.REMOVED:
@@ -2842,7 +2856,7 @@ sys.exit(fit.main())
 
     def test_mcp_input_schema_equals_translated_contract_schema(self):
         listed = self._rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}], full=True)[0]["result"]["tools"]
-        self.assertEqual([t["name"] for t in listed], [t["name"] for t in self.contract["tools"]], "MCP order == contract order")
+        self.assertEqual([t["name"] for t in listed], [t["name"] for t in self.contract["tools"] if "alias_of" not in t], "MCP order == contract order")
         for entry in listed:
             spec = self.tools[entry["name"]]
             self.assertEqual(self._norm(entry["inputSchema"]), self._norm(_contract.mcp_input_schema(spec)), entry["name"])
@@ -3242,7 +3256,7 @@ sys.exit(fit.main())
         """3.0.0 settles the 2.10.9 (Python 3.9) and 2.14.0 (FFmpeg 5.x) deprecations: both move from
         `deprecated` to `removed`, the floors are 3.10 and 6.1, doctor and the npx installer print
         the same FFmpeg line, and CI no longer runs 3.9 or a 5.x build."""
-        self.assertEqual(self.contract["deprecated"], [])
+        self.assertEqual([e for e in self.contract["deprecated"] if "Python" in e["what"] or "FFmpeg" in e["what"]], [])
         removed = {e["what"]: e for e in self.contract["removed"] if e["removed_in"] == "3.0.0"}
         py = next(e for w, e in removed.items() if "Python 3.9" in w)
         ff = next(e for w, e in removed.items() if "FFmpeg 5.x" in w)
@@ -3944,9 +3958,30 @@ sys.exit(fit.main())
             running = skills / f"ffmpeg-skill.tmp-{os.getpid()}"
             running.mkdir()
             (running / "SKILL.md").write_text("being copied", encoding="utf-8")
+            # a run killed between its two renames (or whose restore rename failed) left the
+            # previous install at <name>.bak-<pid>: a whole skill whose SKILL.md says
+            # name: ffmpeg-skill, so an agent scanning the folder saw the skill twice, and neither
+            # a re-install nor --uninstall removed it
+            # and a live pid's <name>.bak-<pid> is that install's previous copy mid-swap: it stays too
+            running_bak = skills / f"ffmpeg-skill.bak-{os.getpid()}"
+            running_bak.mkdir()
+            (running_bak / "SKILL.md").write_text("---\nname: ffmpeg-skill\n---\n", encoding="utf-8")
+            kept = sorted([running.name, running_bak.name, "ffmpeg-skill.tmp-notes", "ffmpeg-skill.bak-notes"])
+            (skills / "ffmpeg-skill.bak-notes").mkdir()
+
+            def leave_scratch():
+                for name in (f"ffmpeg-skill.tmp-{ended.pid}", f"ffmpeg-skill.bak-{ended.pid}"):
+                    (skills / name).mkdir(exist_ok=True)
+                    (skills / name / "SKILL.md").write_text("---\nname: ffmpeg-skill\n---\n", encoding="utf-8")
+            leave_scratch()
+            sh("node", installer, env=env)
+            self.assertEqual(sorted(p.name for p in skills.iterdir()), sorted(kept + ["ffmpeg-skill"]),
+                             "a finished install removes the <name>.tmp-<pid> and <name>.bak-<pid> an ended run left")
+            leave_scratch()
             sh("node", installer, "--uninstall", env=env)
-            self.assertEqual(sorted(p.name for p in skills.iterdir()), sorted([running.name, "ffmpeg-skill.tmp-notes"]),
-                             "only the installer's own <name>.tmp-<pid> folders are removed, and only when that pid is gone")
+            self.assertEqual(sorted(p.name for p in skills.iterdir()), kept,
+                             "only the installer's own <name>.tmp-<pid> and <name>.bak-<pid> folders are removed, "
+                             "and only when that pid is gone")
 
     # ------------------------------------------------------------------ integration: claims hold at run time
     def test_every_1_17_flag_is_reachable_off(self):
@@ -5766,6 +5801,156 @@ sys.exit(fit.main())
         colon = self.work / "clip:1.mp4"
         tool("cut", self.src, "--start", "0", "--end", "0.5", "-o", "./clip:1.mp4", cwd=self.work)
         self.assertTrue(colon.exists())
+
+
+    @staticmethod
+    def _inputs_and_options(argv):
+        """(input, the options before it that apply to it) for each input of one ffmpeg/ffprobe argv."""
+        if os.path.basename(argv[0]) == "ffprobe" and "-i" not in argv[1:-1]:
+            return [] if len(argv) < 2 or argv[-1].startswith("-") else [(argv[-1], argv[1:-1])]
+        found, since = [], 1
+        for i in range(1, len(argv) - 1):
+            if argv[i] == "-i":
+                found.append((argv[i + 1], argv[since:i]))
+                since = i + 2
+        return found
+
+    @unittest.skipIf(os.name == "nt", "the logging stand-ins for ffmpeg and ffprobe are POSIX scripts")
+    def test_every_executed_ffmpeg_and_ffprobe_input_carries_the_protocol_whitelist(self):
+        """#572: every input of every ffmpeg and ffprobe process a tool starts names its protocols
+        (`-protocol_whitelist file`), so a demuxer that finds a URL inside a local file cannot open
+        it through another protocol. Measured where the processes start: stand-ins for ffmpeg and
+        ffprobe first on PATH log each argv and run the real program."""
+        work = self.out("protocol_log"); work.mkdir(exist_ok=True)
+        log, bindir = work / "log", work / "bin"
+        log.mkdir(exist_ok=True); bindir.mkdir(exist_ok=True)
+        for name in ("ffmpeg", "ffprobe"):
+            stand_in = bindir / name
+            stand_in.write_text(f"#!{sys.executable}\nimport json, os, sys, uuid\n"
+                                f"open(os.path.join({str(log)!r}, uuid.uuid4().hex), 'w').write(json.dumps(sys.argv))\n"
+                                f"os.execv({shutil.which(name)!r}, [{shutil.which(name)!r}] + sys.argv[1:])\n", encoding="utf-8")
+            stand_in.chmod(0o755)
+        env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+        frames = work / "frames"; frames.mkdir(exist_ok=True)
+        for i in range(3):
+            ffmpeg("-f", "lavfi", "-i", f"color=c=blue:s=64x64", "-frames:v", "1", frames / f"f{i:03d}.png")
+        listing = work / "clips.txt"; listing.write_text(f"{self.src}\n{self.camb}\n", encoding="utf-8")
+        project = work / "project.json"
+        project.write_text(json.dumps({"output": str(work / "render.mp4"), "clips": [{"src": str(self.src), "in": 0, "out": 1}]}), encoding="utf-8")
+        runs = [("probe", [self.src]), ("cut", [self.src, "--start", "0", "--end", "1", "-o", work / "cut.mp4"]),
+                ("cut", [self.src, "--segments", "0-1,2-3", "-o", work / "parts.mp4"]),
+                ("fit", [self.src, "--aspect", "1:1", "-o", work / "fit.mp4"]),
+                ("join", [self.src, self.camb, "-o", work / "join.mp4"]),
+                ("join", [f"--list={listing}", "--transition", "none", "--copy", "-o", work / "join_copy.mp4"]),
+                ("export", [self.src, "--preset", "youtube", "-o", work / "export.mp4"]),
+                ("check", [self.src, "--platform", "youtube"]), ("loop", [self.src, "--times", "2", "-o", work / "loop.mp4"]),
+                ("overlay", [self.src, "--image", self.logo, "-o", work / "overlay.mp4"]),
+                ("sequence", ["--dir", frames, "--pattern", "*.png", "-o", work / "seq.mp4"]),
+                ("render", [project]), ("silence", [self.src, "--list"])]
+        for name, args in runs:
+            proc = tool(name, *args, "--overwrite", "--json", check=False, env=env)
+            doc = json.loads(proc.stdout)
+            err = (doc[0] if isinstance(doc, list) else doc).get("error") or {}
+            self.assertIn(err.get("kind"), (None, "verification"), (name, err, proc.stderr[-400:]))
+        seen = {"ffmpeg": 0, "ffprobe": 0}
+        for entry in log.iterdir():
+            argv = json.loads(entry.read_text(encoding="utf-8"))
+            for path, opts in self._inputs_and_options(argv):
+                seen[os.path.basename(argv[0])] += 1
+                self.assertIn(("-protocol_whitelist", "file"), list(zip(opts, opts[1:])), (path, argv))
+        self.assertGreater(seen["ffmpeg"], 10, seen)
+        self.assertGreater(seen["ffprobe"], 10, seen)
+
+    def test_a_file_a_demuxer_opens_from_inside_a_local_input_is_kept_to_the_file_protocol(self):
+        """#572, the second guard on its own: a concat list the skill passes as `-f concat` is not
+        read as a playlist (_refuse_playlist), so the protocol list is what stops an entry that
+        names another protocol. FFmpeg's own default for a local file also lets `data:` and
+        `crypto:` through; the command the runner builds does not, and a plain file still opens."""
+        import base64, importlib
+        runner = importlib.import_module("_common.runner")
+        work = self.out("protocol_list"); work.mkdir(exist_ok=True)
+        clip = work / "clip.ts"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10", "-t", "0.5", "-c:v", "mpeg2video", clip)
+        inline = work / "inline.txt"
+        inline.write_text("file 'data:video/mp2t;base64," + base64.b64encode(clip.read_bytes()).decode() + "'\n", encoding="utf-8")
+        plain = work / "plain.txt"
+        plain.write_text(f"file '{clip}'\n", encoding="utf-8")
+        def codecs(listfile, guarded):
+            cmd = ["ffprobe", "-v", "error", "-f", "concat", "-safe", "0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", "-i", str(listfile)]
+            return sh(*(runner.guard_input_names(cmd) if guarded else cmd), check=False)
+        self.assertIn("mpeg2video", codecs(inline, guarded=False).stdout, "FFmpeg's default opens the data: entry")
+        refused = codecs(inline, guarded=True)
+        self.assertNotIn("mpeg2video", refused.stdout)
+        self.assertIn("not on whitelist", refused.stderr)
+        self.assertIn("mpeg2video", codecs(plain, guarded=True).stdout)
+
+    def test_ffmpeg_skill_roots_keeps_every_input_and_output_under_the_named_directories(self):
+        """#572: with FFMPEG_SKILL_ROOTS set, an input or an output that does not resolve under
+        one of its directories is refused as kind input (path_outside_roots), dry runs included,
+        by every tool in tests/sweep.py's table and the ones swept by hand; a symlink inside is
+        followed to where it points. The system temp directory, where the tools keep their
+        intermediates, still works, and unset the variable changes nothing."""
+        sys.path.insert(0, str(ROOT / "tests"))
+        import sweep
+        # the tools' temp directory is one of their own beside the two, so neither is inside it
+        # wherever OUT is (revert_proof.py runs the suite from a checkout in the system temp dir)
+        inside, outside, tmp = (Path(OUT) / f"roots_{n}" for n in ("inside", "outside", "tmp"))
+        for d in (inside, outside, tmp):
+            shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)
+        src = inside / "clip.mp4"; shutil.copy(self.src, src)
+        stray = outside / "clip.mp4"; shutil.copy(self.src, stray)
+        link = inside / "link.mp4"
+        if hasattr(os, "symlink"):
+            os.symlink(stray, link)
+        env = dict(os.environ, FFMPEG_SKILL_ROOTS=os.pathsep.join(["relative/ignored", str(inside)]),
+                   TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp))
+        facts = sweep.facts_for(str(src), str(tmp))
+
+        def refused(name, *args):
+            proc = tool(name, *args, "--dry-run", "--json", check=False, env=env)
+            doc = json.loads(proc.stdout)
+            if name == "verify":  # its steps run as tools of their own; a step's refusal fails the step
+                self.assertIn(f"{str(args[0])!r} resolves to", doc["files"][0]["steps"][0]["error"])
+                return None
+            err = doc.get("error") or {}
+            self.assertEqual((err.get("kind"), err.get("reason")), ("input", "path_outside_roots"), (name, args, proc.stdout[-400:]))
+            self.assertEqual(err["details"]["roots"], [os.path.normcase(os.path.realpath(inside))])
+            self.assertEqual(err["details"]["ignored"], ["relative/ignored"])
+            return err
+
+        for t, (args, ext) in sweep.TABLE.items():
+            name, args = t.split()[0], [a.format(**facts) for a in args]
+            with self.subTest(tool=t):
+                for given in (stray, link) if link.exists() else (stray,):
+                    err = refused(name, given, *args, *(["-o", tmp / f"roots_{name}{ext}"] if ext else []))
+                    if err:
+                        self.assertEqual(err["details"]["resolved"], os.path.normcase(os.path.realpath(stray)))
+                if ext:  # the output, or a side file beside it (caption's .srt), is the path refused
+                    err = refused(name, src, *args, "-o", outside / f"out{ext}")
+                    self.assertEqual(Path(err["details"]["path"]).parent, outside)
+        project = inside / "project.json"
+        project.write_text(json.dumps({"output": str(outside / "render.mp4"), "clips": [{"src": str(src)}]}), encoding="utf-8")
+        frames = outside / "frames"; frames.mkdir()
+        ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x64", "-frames:v", "1", frames / "f000.png")
+        kept_in = inside / "project_in.json"
+        kept_in.write_text(json.dumps({"output": str(inside / "render.mp4"), "clips": [{"src": str(src)}]}), encoding="utf-8")
+        folder = inside / "batch"; folder.mkdir(); shutil.copy(self.src, folder / "a.mp4")
+        recipe = inside / "recipe.json"
+        recipe.write_text(json.dumps({"glob": "*.mp4", "output_dir": str(outside / "batch_out"),
+                                      "steps": [["loudness.py", "{in}", "-o", "{out}"]]}), encoding="utf-8")
+        for name, args in (("join", [src, stray, "-o", inside / "join.mp4"]), ("render", [project]),
+                           ("render", [kept_in, "--work", outside / "work"]), ("batch", [folder, "--recipe", recipe]),
+                           ("sequence", ["--dir", frames, "--pattern", "*.png", "-o", inside / "seq.mp4"]),
+                           ("cut", [src, "--start", "0", "--end", "1", "-o", inside / "cut.mp4", "--plan", outside / "plan.json"])):
+            with self.subTest(tool=name):
+                refused(name, *args)
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["clip.mp4", "frames"], "a refused run wrote outside the roots")
+        # inside the roots a real run works, its intermediates in the temp directory included
+        done = tool("cut", src, "--segments", "0-1,2-3", "-o", inside / "parts.mp4", "--json", env=env)
+        self.assertEqual(json.loads(done.stdout)["status"], "completed")
+        self.assertTrue((inside / "parts.mp4").is_file())
+        # unset, a path anywhere is taken as before
+        tool("probe", stray, "--json", env={k: v for k, v in env.items() if k != "FFMPEG_SKILL_ROOTS"})
 
     def test_refusals_at_the_runner_choke_points_carry_a_reason_and_details(self):
         """The runner's guards refused in prose only. Each now names error.reason and the facts in
@@ -12190,6 +12375,34 @@ def _unused_imports(path: Path) -> "list":
     return sorted(f"{name} (line {line})" for name, line in bound.items() if name not in used)
 
 
+class PremultipliedMergeMatrix740Tests(unittest.TestCase):
+    """#740: color.py's wide merge leg (a premultiplied ProRes 4444 master's mask kept at 16 bits
+    through the RGB premultiply) converted the graded YUV to RGB with `format=gbrp16le` alone,
+    which is swscale's BT.601 default: a BT.709-tagged source was read as BT.601 and written back
+    tagged BT.709, so opaque pixels came out by the 709->601 shift."""
+
+    def test_the_wide_merge_leg_names_the_matrix_the_grade_leaves(self):
+        from _common.alpha import wide_merge_leg
+        legs = {name: wide_merge_leg("prores4444", meta) for name, meta in (
+            ("bt709", {"video": {"color_space": "bt709"}}),
+            ("bt601", {"video": {"color_space": "smpte170m"}}),
+            ("untagged", {"video": {}}),
+            ("rgb", {"video": {"pix_fmt": "rgba", "color_space": "gbr"}}))}
+        self.assertIn("scale=in_color_matrix=bt709,format=gbrp16le", legs["bt709"])
+        self.assertIn("scale=in_color_matrix=bt601,format=gbrp16le", legs["bt601"])
+        self.assertIn("scale=in_color_matrix=bt709,format=gbrp16le", legs["rgb"],
+                      "an RGB source on a YUV line is the BT.709 that line is (#496)")
+        self.assertNotIn("in_color_matrix", legs["untagged"],
+                         "an untagged source has no matrix to name: swscale's own default stands")
+
+    def test_color_py_builds_the_leg_through_the_helper(self):
+        src = (SCRIPTS / "color.py").read_text(encoding="utf-8")
+        self.assertIn("wide_merge_leg(alpha_codec, meta)", src)
+        inline = [i for i, line in enumerate(src.splitlines(), 1)
+                  if "format=gbrp16le" in line and not line.strip().startswith("#")]
+        self.assertEqual(inline, [], f"color.py builds the wide merge leg inline at line {inline}")
+
+
 class Audit467Tests(unittest.TestCase):
     """The items of audit #467 still open at 3.8.10: memory, distribution, the contract's size,
     the demo gallery and the agent eval runner."""
@@ -13674,7 +13887,8 @@ class BasicsAudit558Tests(unittest.TestCase):
         for kept in ("take.mp4", "./-take.mp4", "dir/-take.mp4", "/abs/-take.mp4", "-", "C:\\clips\\-take.mp4", "C:/clips/take.mp4"):
             self.assertEqual(runner.file_arg(kept), kept)
         self.assertEqual(runner.guard_input_names(["ffmpeg", "-y", "-i", "-a.mp4", "-i", "b.mp4", "-map", "0", "out.mp4"]),
-                         ["ffmpeg", "-y", "-i", "./-a.mp4", "-i", "b.mp4", "-map", "0", "out.mp4"])
+                         ["ffmpeg", "-y", "-protocol_whitelist", "file", "-i", "./-a.mp4",
+                          "-protocol_whitelist", "file", "-i", "b.mp4", "-map", "0", "out.mp4"])
         self.assertEqual(runner.guard_input_names(["ffprobe", "-version"]), ["ffprobe", "-version"], "an option stays an option")
         work = self.work / "dash"
         work.mkdir(exist_ok=True)
@@ -13809,6 +14023,32 @@ class StumbleLedgerTests(unittest.TestCase):
                 if span and isinstance(spec.get("default"), (int, float)) and spec.get("type") in ("integer", "number"):
                     self.assertTrue(float(span[1]) <= spec["default"] <= float(span[2]), f"{t['name']} {name}: default {spec['default']} is outside {span[0]}")
 
+    def test_a_zero_an_option_cannot_take_is_refused_before_a_dry_run_749(self):
+        """#749: a 0 was read as another value without a word. `export.py --duration 0` wrote the
+        whole clip, `--pad-blur 0` blurred with radius 1 in export.py where fit.py refused it,
+        `caption.py --font-size 0` reported size_used 0 for 28 px text, and `--emoji-scale 0` drew
+        the emoji at 1.0 in caption.py and graphics.py. Each help now states its range (> 0, or
+        1..2000 as overlay.py's --font-size) and the shared step refuses what is outside it, in a
+        dry run as well; the values inside it still run."""
+        clip, srt = str(ROOT / "demos" / "footage" / "veo_sea.mp4"), str(ROOT / "demos" / "footage" / "veo_talk_en.srt")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "o.mp4")
+            run = lambda tool, *argv: subprocess.run([sys.executable, str(ROOT / "scripts" / f"{tool}.py"), clip, *argv, "-o", out, "--dry-run", "--json"],
+                                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+            rows = ((("export", "--preset", "youtube"), "--duration", "2", "> 0"),
+                    (("export", "--preset", "tiktok", "--pad-fill", "blur"), "--pad-blur", "5", "> 0"),
+                    (("fit", "--aspect", "9:16", "--fit", "blur"), "--pad-blur", "5", "> 0"),
+                    (("caption", "--srt", srt), "--font-size", "24", "1..2000"),
+                    (("caption", "--srt", srt), "--emoji-scale", "1.5", "> 0"),
+                    (("graphics", "--template", "hook", "--title", "hi"), "--emoji-scale", "1.5", "> 0"))
+            for (tool, *argv), flag, kept, span in rows:
+                with self.subTest(tool=tool, flag=flag):
+                    proc = run(tool, *argv, f"{flag}=0")
+                    self.assertEqual(proc.returncode, 1, proc.stderr[-300:])
+                    error = json.loads(proc.stdout)["error"]
+                    self.assertEqual(error["message"], f"{flag} 0 is outside what this option takes, {span}")
+                    self.assertEqual(run(tool, *argv, f"{flag}={kept}").returncode, 0)
+
     def test_every_option_has_help_text(self):
         """#558: twenty options (--preset on eight tools, the colour and font options of overlay
         and graphics, ...) had no help, the text `--help` and every MCP tool description show an
@@ -13872,6 +14112,79 @@ class StumbleLedgerTests(unittest.TestCase):
         for tool, argv in (("cut", ("--start", "1", "--end", "2", "--bogus")), ("export", ("--codec", "hevc")), ("stabilize", ("--zoom=5%", "--wat"))):
             with self.subTest(tool=tool, argv=argv):
                 self.assertNotIn("try:", run(tool, *argv))
+
+    def test_a_try_line_is_a_command_the_tool_accepts(self):
+        """`speedramp.py IN --ramp 3:6:0.5` ended with `try: ... --segment 3:6:0.5`, which speedramp
+        refuses (START-END:FACTOR): --segment was the one option whose help mentions 'ramp', and the
+        value went with it. Every rule that writes a `try:` is run on every tool of tests/sweep.py's
+        table, and each command it prints is run with --dry-run: a misspelt option of the tool (with
+        the value it was given), a choice misspelt or given a common other word, a number with its
+        unit. A flag that another tool takes, or one that only shares a word or a mention in the
+        help, has no single answer here: the hint names the options and no command follows."""
+        import argparse
+        import concurrent.futures
+        sys.path.insert(0, str(ROOT / "tests"))
+        import sweep
+        from _common import runner
+
+        def taught(tool, argv):
+            parser, saved, err = parsers[tool], sys.argv, io.StringIO()
+            sys.argv = [str(SCRIPTS / f"{tool}.py"), *argv]
+            try:
+                with contextlib.redirect_stderr(err):
+                    parser.parse_args(argv)
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = saved
+            return err.getvalue()
+
+        with tempfile.TemporaryDirectory() as work:
+            clip = str(ROOT / "demos" / "footage" / "veo_sea.mp4")
+            facts = sweep.facts_for(clip, work)
+            parsers = {p.stem: _contract._capture_parser(p) for p in sorted(SCRIPTS.glob("[!_]*.py"))}
+            self.assertNotIn("\ntry:", taught("speedramp", [clip, "--ramp", "3:6:0.5", "-o", "x.mp4"]))
+            self.assertIn("--segment", taught("speedramp", [clip, "--ramp", "3:6:0.5", "-o", "x.mp4"]))
+            commands, foreign = {}, []
+            for name, (base, ext) in sweep.TABLE.items():
+                tool = name.split()[0]
+                if tool == "verify":  # it runs its steps for real and ignores --dry-run
+                    continue
+                base, out = [b.format(**facts) for b in base], (["-o", str(Path(work) / f"o{ext}")] if ext else [])
+                acts = {o: a for a in parsers[tool]._actions for o in a.option_strings if o.startswith("--")}
+                cases = []
+                for i, word in enumerate(base):
+                    action = acts.get(word)
+                    if action and len(word) > 5:
+                        cases.append(("option", base[:i] + [word[:3] + word[4] + word[3] + word[5:]] + base[i + 1:]))
+                    if action and action.choices:
+                        cases += [("choice", base[:i + 1] + [w] + base[i + 2:]) for w in (base[i + 1][:-1], *runner._OTHER_WORDS)]
+                    if re.fullmatch(r"\d+(\.\d+)?", word):
+                        cases += [("unit", base[:i] + [word + unit] + base[i + 1:]) for unit in ("s", "px")]
+                for other, parser in parsers.items():
+                    for flag, action in {o: a for a in parser._actions for o in a.option_strings if o.startswith("--")}.items():
+                        if other != tool and not any(o.startswith(flag) for o in acts) and flag not in runner.SHARED:
+                            said = taught(tool, [clip, *base, flag, *([] if action.nargs == 0 else ["2"]), *out])
+                            foreign += [f"{name}: {flag} ({other}.py)"] if "\ntry:" in said else []
+                for rule, argv in cases:
+                    line = re.search(r"\ntry: (.*)", taught(tool, [clip, *argv, *out]))
+                    if line:
+                        commands[line[1]] = rule
+            self.assertEqual(foreign, [], "another tool's option was answered with a command")
+            self.assertEqual(sorted(set(commands.values())), ["choice", "option", "unit"], "every rule was run")
+
+            def refused(line):
+                # the try: line is quoted for the shell it is printed on: list2cmdline on Windows, shlex.join elsewhere
+                cmd = [w.strip('"') for w in shlex.split(line, posix=False)] if os.name == "nt" else shlex.split(line)
+                proc = subprocess.run([sys.executable, *cmd[1:], "--dry-run", "--json", "--overwrite"], capture_output=True,
+                                      text=True, encoding="utf-8", timeout=300, cwd=work)
+                try:
+                    # check.py runs the command and fails a check of the clip (kind verification): accepted
+                    return None if proc.returncode == 0 or json.loads(proc.stdout)["error"]["kind"] == "verification" else line
+                except ValueError:
+                    return line + " :: " + proc.stderr[-200:]
+            with concurrent.futures.ThreadPoolExecutor(4) as pool:
+                self.assertEqual([r for r in pool.map(refused, commands) if r], [])
 
     def test_three_things_most_models_asked_for_are_options_now(self):
         """Nine models were given the same blind tasks; these three shapes came from most of them and
@@ -14044,6 +14357,98 @@ class TestOutIsolationTests(unittest.TestCase):
                 proc = subprocess.run([sys.executable, "-m", "unittest", *target],
                                       cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
                 self.assertEqual(proc.returncode, 0, f"{target}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+
+
+class EncodePolicyTests(unittest.TestCase):
+    """#576: $FFMPEG_SKILL_ENCODE sets the encoder flags' defaults and, `locked`, refuses a call that
+    asks for something else before ffmpeg runs; every re-encoding result records the settings it
+    ran with (`encode`) and a --fast one says it is a preview."""
+
+    @classmethod
+    def setUpClass(cls):
+        require_ffmpeg_or_skip("ffmpeg", "ffprobe")
+        OUT.mkdir(parents=True, exist_ok=True)
+        cls.src = OUT / "ep_source.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i", "sine=d=1.2", "-t", "1.2",
+               "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", cls.src)
+
+    def run_tool(self, name, *args, policy=None, ok=True):
+        env = {k: v for k, v in os.environ.items() if k != ENCODE_ENV}
+        if policy is not None:
+            env[ENCODE_ENV] = policy
+        out = OUT / f"ep_{name}_{abs(hash((args, policy)))}.mp4"
+        proc = tool(name, *args, "-o", out, "--overwrite", "--json", env=env, check=False)
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["status"], "completed" if ok else "failed", proc.stderr)
+        return doc
+
+    def refused(self, doc, key):
+        self.assertEqual((doc["error"]["kind"], doc["error"]["reason"], doc["error"]["details"].get("key")), ("input", "encode_policy", key))
+        self.assertEqual(doc["commands"], [], "refused before any ffmpeg command")
+
+    def test_unset_changes_nothing_and_every_encode_is_recorded(self):
+        self.assertEqual(getattr(sys.modules["_common.runner"], "ENCODE_ENV", None), ENCODE_ENV)
+        doc = self.run_tool("denoise", self.src, "--dry-run")
+        self.assertEqual(doc["encode"], {"codec": "h264", "crf": 18, "preset": "medium", "hw": False, "policy": None})
+        self.assertNotIn("preview", doc)
+        real = self.run_tool("denoise", self.src, "--quality", "30")
+        self.assertEqual((real["encode"]["crf"], real["encode"]["preset"]), (30, "medium"))
+        self.assertIn("-crf 30", real["commands"][-1])
+
+    def test_the_house_settings_are_the_defaults_and_a_flag_still_wins_unlocked(self):
+        house = "codec=hevc, quality=26 ,preset=fast"
+        doc = self.run_tool("denoise", self.src, "--dry-run", policy=house)
+        self.assertEqual(doc["encode"], {"codec": "hevc", "crf": 26, "preset": "fast", "hw": False,
+                                         "policy": {"locked": False, "applied": ["codec", "quality", "preset"]}})
+        doc = self.run_tool("denoise", self.src, "--dry-run", "--quality", "20", "--codec", "h264", policy=house)
+        self.assertEqual((doc["encode"]["codec"], doc["encode"]["crf"], doc["encode"]["preset"]), ("h264", 20, "fast"))
+        self.assertEqual(doc["encode"]["policy"]["applied"], ["preset"])
+        # --fast is a preview, and it says so
+        doc = self.run_tool("denoise", self.src, "--dry-run", "--fast", policy=house)
+        self.assertEqual((doc["preview"], doc["encode"]["preset"]), (True, "veryfast"))
+
+    def test_locked_refuses_another_choice_before_ffmpeg_runs_dry_runs_included(self):
+        house = "codec=h264,quality=20,preset=slow,hw=0,locked"
+        for argv, key in ((["--quality", "18"], "quality"), (["--qual=18"], "quality"), (["--codec", "hevc"], "codec"),
+                          (["--preset", "medium"], "preset"), (["--fast"], "fast"), (["--hw"], "hw")):
+            for dry in (["--dry-run"], []):
+                with self.subTest(argv=argv, dry=dry):
+                    self.refused(self.run_tool("denoise", self.src, *argv, *dry, policy=house, ok=False), key)
+        # the same value, spelled out, is not another choice
+        doc = self.run_tool("denoise", self.src, "--dry-run", "--quality", "20", "--no-hw", policy=house)
+        self.assertEqual(doc["encode"]["policy"], {"locked": True, "applied": ["codec", "preset"]})
+        # without a pinned preset a locked policy leaves --fast previews alone
+        self.assertTrue(self.run_tool("denoise", self.src, "--dry-run", "--fast", policy="quality=20,locked")["preview"])
+
+    def test_an_entry_that_does_not_read_is_refused_where_the_policy_applies(self):
+        for bad in ("quality=high", "codec=vp9", "crf=18", "locked=yes"):
+            with self.subTest(bad=bad):
+                doc = self.run_tool("denoise", self.src, "--dry-run", policy=bad, ok=False)
+                self.assertEqual((doc["error"]["reason"], doc["error"]["details"]["entry"]), ("encode_policy", bad))
+        # a tool with no encoder flag never reads it
+        proc = tool("probe", self.src, env=dict(os.environ, **{ENCODE_ENV: "quality=high"}))
+        self.assertEqual(json.loads(proc.stdout)["file"], str(self.src))
+
+    def test_batch_rows_carry_their_encode_and_the_cache_key_its_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "in"
+            folder.mkdir()
+            shutil.copy(self.src, folder / "a.mp4")
+            recipe = Path(tmp) / "recipe.json"
+            recipe.write_text(json.dumps({"glob": "*.mp4", "output_dir": str(Path(tmp) / "out"),
+                                          "steps": [["denoise.py", "{in}", "-o", "{out}"]]}), encoding="utf-8")
+            env = dict(os.environ, **{ENCODE_ENV: "quality=27"})
+            doc = json.loads(tool("batch", folder, "--recipe", recipe, "--json", env=env).stdout)
+        self.assertEqual(doc["results"][0]["encode"]["crf"], 27)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("batch_576", SCRIPTS / "batch.py")
+        batch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(batch)
+        with unittest.mock.patch.dict(os.environ, {ENCODE_ENV: "quality=27"}):
+            self.assertEqual(batch.gpu_key(), ":encode=quality=27")
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ENCODE_ENV, None)
+            self.assertEqual(batch.gpu_key(), "")
 
 
 if __name__ == "__main__":
